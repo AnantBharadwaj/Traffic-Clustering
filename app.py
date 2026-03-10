@@ -11,7 +11,11 @@ import warnings
 warnings.filterwarnings('ignore')
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = BASE_DIR / "urban_traffic_flow_original.csv"
+DATA_FILE_CANDIDATES = [
+    "urban_traffic_flow_original.csv",
+    "urban_traffic_flow_modified.csv",
+    "urban_traffic_flow_with_target.csv",
+]
 
 # ----------------------------
 # Page Configuration
@@ -38,12 +42,39 @@ def render_page_header(title, subtitle, icon=""):
 # ----------------------------
 @st.cache_data
 def load_and_prepare_data():
-    df = pd.read_csv(DATA_FILE)
-    
+    data_file = None
+    for filename in DATA_FILE_CANDIDATES:
+        candidate = BASE_DIR / filename
+        if candidate.exists():
+            data_file = candidate
+            break
+
+    if data_file is None:
+        available_csvs = sorted([p.name for p in BASE_DIR.glob("*.csv")])
+        raise FileNotFoundError(
+            "No expected dataset file found. "
+            f"Expected one of: {', '.join(DATA_FILE_CANDIDATES)}. "
+            f"Available CSV files in app directory: {available_csvs}"
+        )
+
+    df = pd.read_csv(data_file)
+
+    required_columns = {'Timestamp', 'Vehicle_Count', 'Vehicle_Speed'}
+    missing_columns = required_columns.difference(df.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Dataset is missing required columns: {missing}")
+
     df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce', dayfirst=True)
     df['Hour'] = df['Timestamp'].dt.hour
     df = df[['Vehicle_Count', 'Vehicle_Speed', 'Hour']].dropna()
-    
+
+    if df.empty:
+        raise ValueError("No valid rows found after preprocessing. Check timestamp values and missing data.")
+
+    if len(df) < 3:
+        raise ValueError("At least 3 valid rows are required to train a 3-cluster model.")
+
     return df
 
 @st.cache_data
@@ -61,12 +92,17 @@ def build_cluster_mapping(kmeans_model):
     centers_scaled = kmeans_model.cluster_centers_
     congestion_scores = centers_scaled[:, 0] - centers_scaled[:, 1]
     ordered_clusters = np.argsort(congestion_scores)
+    canonical_labels = ["Free Flow", "Moderate Traffic", "Heavy Congestion"]
 
-    return {
-        int(ordered_clusters[0]): "Free Flow",
-        int(ordered_clusters[1]): "Moderate Traffic",
-        int(ordered_clusters[2]): "Heavy Congestion",
-    }
+    mapping = {}
+    for rank, cluster_id in enumerate(ordered_clusters):
+        cluster_key = int(cluster_id)
+        if rank < len(canonical_labels):
+            mapping[cluster_key] = canonical_labels[rank]
+        else:
+            mapping[cluster_key] = f"Traffic Cluster {rank + 1}"
+
+    return mapping
 
 # Load data
 df = load_and_prepare_data()
@@ -80,7 +116,7 @@ df['Cluster'] = kmeans.predict(scaled_data)
 
 # Map clusters to traffic conditions dynamically (cluster IDs are not semantically fixed)
 cluster_mapping = build_cluster_mapping(kmeans)
-df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping)
+df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping).fillna('Unknown')
     
 # Sidebar Navigation
 # ----------------------------
@@ -217,7 +253,7 @@ elif page == "Predictions":
             st.markdown("---")
             st.subheader("Prediction Result")
             
-            condition = cluster_mapping[prediction]
+            condition = cluster_mapping.get(int(prediction), "Unknown")
             
             if condition == "Free Flow":
                 st.success(f"### ✅ Traffic Condition: {condition}", icon="✅")
