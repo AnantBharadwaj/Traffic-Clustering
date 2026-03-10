@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
@@ -37,17 +36,20 @@ def render_page_header(title, subtitle, icon=""):
     st.title(heading)
     st.caption(subtitle)
 
+
+def resolve_data_file():
+    for filename in DATA_FILE_CANDIDATES:
+        candidate = BASE_DIR / filename
+        if candidate.exists():
+            return candidate
+    return None
+
 # ----------------------------
 # Load and Prepare Dataset (CACHED)
 # ----------------------------
 @st.cache_data
 def load_and_prepare_data():
-    data_file = None
-    for filename in DATA_FILE_CANDIDATES:
-        candidate = BASE_DIR / filename
-        if candidate.exists():
-            data_file = candidate
-            break
+    data_file = resolve_data_file()
 
     if data_file is None:
         available_csvs = sorted([p.name for p in BASE_DIR.glob("*.csv")])
@@ -77,7 +79,7 @@ def load_and_prepare_data():
 
     return df
 
-@st.cache_data
+@st.cache_resource
 def train_kmeans_model(df, n_clusters=3):
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(df)
@@ -104,12 +106,44 @@ def build_cluster_mapping(kmeans_model):
 
     return mapping
 
+
+@st.cache_data(show_spinner=False)
+def compute_model_quality_metrics(scaled_values, cluster_labels):
+    silhouette = silhouette_score(scaled_values, cluster_labels)
+    db_score = davies_bouldin_score(scaled_values, cluster_labels)
+    return silhouette, db_score
+
+
+@st.cache_data(show_spinner=False)
+def compute_elbow_inertias(scaled_values, k_start=2, k_end=10):
+    inertias = []
+    for k in range(k_start, k_end + 1):
+        kmeans_temp = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans_temp.fit(scaled_values)
+        inertias.append(kmeans_temp.inertia_)
+    return inertias
+
 # Load data
-df = load_and_prepare_data()
+try:
+    df = load_and_prepare_data()
+except Exception as e:
+    st.error("Unable to load dataset. Ensure at least one expected CSV file is present in the app directory.")
+    st.info(
+        "Expected one of: "
+        + ", ".join(DATA_FILE_CANDIDATES)
+        + ". If you recently changed files, redeploy and refresh the app."
+    )
+    st.exception(e)
+    st.stop()
 
 # Train model with optimal clusters
 optimal_clusters = 3
-kmeans, scaler, scaled_data = train_kmeans_model(df, optimal_clusters)
+try:
+    kmeans, scaler, scaled_data = train_kmeans_model(df, optimal_clusters)
+except Exception as e:
+    st.error("Model initialization failed. Check whether the dataset has sufficient valid rows.")
+    st.exception(e)
+    st.stop()
 
 # Add cluster labels to dataframe
 df['Cluster'] = kmeans.predict(scaled_data)
@@ -122,14 +156,38 @@ df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping).fillna('Unknown')
 # ----------------------------
 st.sidebar.title("🚦 Urban Traffic Studio")
 st.sidebar.caption("Interactive clustering and traffic intelligence dashboard")
-page = st.sidebar.radio("Select Page", ["Dashboard", "Predictions", "Data Analysis", "Model Info"])
+page = st.sidebar.radio("Select Page", ["Home", "Dashboard", "Predictions", "Data Analysis", "Model Info", "About"])
 st.sidebar.markdown("---")
 st.sidebar.caption("Built with Streamlit, Plotly, and Scikit-learn")
 
 # ----------------------------
+# HOME PAGE
+# ----------------------------
+if page == "Home":
+    render_page_header(
+        "Urban Traffic Intelligence",
+        "Explore congestion patterns, run instant predictions, and monitor cluster quality from one workspace.",
+        icon="🏙️",
+    )
+
+    silhouette, db_score = compute_model_quality_metrics(scaled_data, df['Cluster'])
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Data Points", len(df))
+    with col2:
+        st.metric("Silhouette Score", f"{silhouette:.3f}")
+    with col3:
+        st.metric("Davies-Bouldin", f"{db_score:.3f}")
+
+    st.markdown("---")
+    st.subheader("Get Started")
+    st.write("Use Dashboard for live cluster summaries, Predictions for scenario checks, and Data Analysis for deeper visual exploration.")
+    st.info("Tip: For best predictions, enter values near the observed dataset ranges shown in the Predictions page.")
+
+# ----------------------------
 # DASHBOARD PAGE
 # ----------------------------
-if page == "Dashboard":
+elif page == "Dashboard":
     render_page_header(
         "Traffic Flow Pattern Clustering",
         "Monitor traffic behavior, cluster characteristics, and model quality at a glance.",
@@ -142,10 +200,9 @@ if page == "Dashboard":
     with col2:
         st.metric("Number of Clusters", optimal_clusters, delta=None)
     with col3:
-        silhouette = silhouette_score(scaled_data, df['Cluster'])
+        silhouette, db_score = compute_model_quality_metrics(scaled_data, df['Cluster'])
         st.metric("Silhouette Score", f"{silhouette:.3f}", delta=None)
     with col4:
-        db_score = davies_bouldin_score(scaled_data, df['Cluster'])
         st.metric("Davies-Bouldin Score", f"{db_score:.3f}", delta=None)
     
     st.markdown("---")
@@ -178,8 +235,6 @@ if page == "Dashboard":
     # Cluster characteristics
     st.markdown("---")
     st.subheader("📍 Cluster Characteristics")
-    
-    cluster_stats = df.groupby('Cluster')[['Vehicle_Count', 'Vehicle_Speed', 'Hour']].agg(['mean', 'std', 'min', 'max'])
     
     for cluster_id in sorted(df['Cluster'].unique()):
         with st.expander(f"**{cluster_mapping[cluster_id]}** (Cluster {cluster_id})"):
@@ -220,20 +275,22 @@ elif page == "Predictions":
     col1, col2, col3 = st.columns(3)
     
     with col1:
+        default_vehicle_count = int(np.clip(df['Vehicle_Count'].median(), 0, 1000))
         vehicle_count = st.number_input(
             "Vehicle Count",
             min_value=0,
             max_value=1000,
-            value=50,
+            value=default_vehicle_count,
             step=1,
         )
     
     with col2:
+        default_vehicle_speed = float(np.clip(df['Vehicle_Speed'].median(), 0.0, 150.0))
         vehicle_speed = st.number_input(
             "Vehicle Speed (km/h)",
             min_value=0.0,
             max_value=150.0,
-            value=40.0,
+            value=default_vehicle_speed,
             step=0.1,
         )
     
@@ -242,6 +299,19 @@ elif page == "Predictions":
     
     if st.button("🎯 Predict Traffic Pattern", use_container_width=True):
         try:
+            validation_errors = []
+            if vehicle_count <= 0:
+                validation_errors.append("Vehicle Count should be greater than 0 for a meaningful prediction.")
+            if vehicle_speed <= 0:
+                validation_errors.append("Vehicle Speed should be greater than 0 km/h.")
+            if vehicle_speed > 130:
+                st.warning("Vehicle Speed is unusually high. Prediction reliability may be lower.")
+
+            if validation_errors:
+                for error_msg in validation_errors:
+                    st.error(error_msg)
+                st.stop()
+
             new_data = [[vehicle_count, vehicle_speed, hour]]
             new_scaled = scaler.transform(new_data)
             prediction = kmeans.predict(new_scaled)[0]
@@ -407,8 +477,7 @@ elif page == "Model Info":
     
     with col2:
         st.subheader("Model Performance")
-        silhouette = silhouette_score(scaled_data, df['Cluster'])
-        db_score = davies_bouldin_score(scaled_data, df['Cluster'])
+        silhouette, db_score = compute_model_quality_metrics(scaled_data, df['Cluster'])
         
         st.write(f"**Silhouette Score:** {silhouette:.4f}")
         st.write("*(Higher is better, range: -1 to 1)*")
@@ -433,17 +502,11 @@ elif page == "Model Info":
     """)
     
     st.subheader("🔧 Elbow Method")
-    inertias = []
-    K_range = range(2, 11)
-    
-    with st.spinner("Calculating inertia values..."):
-        for k in K_range:
-            kmeans_temp = KMeans(n_clusters=k, random_state=42, n_init=10)
-            kmeans_temp.fit(scaled_data)
-            inertias.append(kmeans_temp.inertia_)
+    K_range = list(range(2, 11))
+    inertias = compute_elbow_inertias(scaled_data, k_start=2, k_end=10)
     
     fig = px.line(
-        x=list(K_range),
+        x=K_range,
         y=inertias,
         markers=True,
         title="Elbow Curve for Optimal K",
@@ -459,3 +522,26 @@ elif page == "Model Info":
     st.write(f"**Features:** {', '.join(df.columns.tolist())}")
     st.write(f"**Data Types:**")
     st.dataframe(df.dtypes)
+
+# ----------------------------
+# ABOUT PAGE
+# ----------------------------
+elif page == "About":
+    render_page_header(
+        "About and Contact",
+        "Project context, deployment details, and how to request enhancements.",
+        icon="ℹ️",
+    )
+
+    st.subheader("Project Summary")
+    st.write(
+        "This application uses KMeans clustering on vehicle count, vehicle speed, and hour-of-day features "
+        "to classify traffic conditions into interpretable congestion bands."
+    )
+
+    st.subheader("Deployment Notes")
+    st.write("This Streamlit app auto-redeploys when new commits are pushed to the connected GitHub branch.")
+    st.write("For reliable updates, keep app.py, requirements.txt, and at least one supported CSV dataset in the repository root.")
+
+    st.subheader("Contact")
+    st.write("For feature requests or issue reports, contact the project maintainer through your GitHub repository issues page.")
