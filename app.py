@@ -79,6 +79,21 @@ def get_tomtom_api_key():
     return None
 
 
+def get_google_maps_api_key():
+    try:
+        secret_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
+        if secret_key:
+            return str(secret_key).strip()
+    except Exception:
+        pass
+
+    env_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    if env_key:
+        return env_key.strip()
+
+    return None
+
+
 def resolve_data_file():
     for filename in DATA_FILE_CANDIDATES:
         candidate = BASE_DIR / filename
@@ -187,7 +202,7 @@ def fetch_live_tomtom_flow(lat, lon, api_key):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_location_name(lat, lon, api_key):
+def fetch_location_name_tomtom(lat, lon, api_key):
     url = (
         f"https://api.tomtom.com/search/2/reverseGeocode/{lat},{lon}.json?"
         + urlencode({"key": api_key})
@@ -212,6 +227,66 @@ def fetch_location_name(lat, lon, api_key):
     ]
     fallback = ", ".join([part for part in parts if part])
     return fallback if fallback else "Unknown location"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_location_name_google(lat, lon, api_key):
+    url = (
+        "https://maps.googleapis.com/maps/api/geocode/json?"
+        + urlencode({"latlng": f"{lat},{lon}", "key": api_key})
+    )
+
+    with urlopen(url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    results = payload.get("results", [])
+    if not results:
+        return "Unknown location"
+
+    return results[0].get("formatted_address", "Unknown location")
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def search_locations_google(query, api_key, limit=5):
+    q = query.strip()
+    if not q:
+        return []
+
+    auto_url = (
+        "https://maps.googleapis.com/maps/api/place/autocomplete/json?"
+        + urlencode({"input": q, "types": "geocode", "key": api_key})
+    )
+
+    with urlopen(auto_url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    predictions = payload.get("predictions", [])[:limit]
+    results = []
+
+    for item in predictions:
+        place_id = item.get("place_id")
+        description = item.get("description", "Unknown location")
+        if not place_id:
+            continue
+
+        details_url = (
+            "https://maps.googleapis.com/maps/api/place/details/json?"
+            + urlencode({"place_id": place_id, "fields": "geometry,formatted_address", "key": api_key})
+        )
+        with urlopen(details_url, timeout=15) as details_response:
+            details_payload = json.loads(details_response.read().decode("utf-8"))
+
+        result = details_payload.get("result", {})
+        geometry = result.get("geometry", {}).get("location", {})
+        lat = geometry.get("lat")
+        lon = geometry.get("lng")
+        if lat is None or lon is None:
+            continue
+
+        label = result.get("formatted_address") or description
+        results.append({"label": label, "lat": float(lat), "lon": float(lon)})
+
+    return results
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -242,6 +317,32 @@ def search_locations_by_text(query, api_key, limit=5):
         results.append({"label": label, "lat": float(lat), "lon": float(lon)})
 
     return results
+
+
+def resolve_location_name(lat, lon, tomtom_api_key, google_maps_api_key):
+    if google_maps_api_key:
+        try:
+            return fetch_location_name_google(lat, lon, google_maps_api_key)
+        except Exception:
+            pass
+
+    if tomtom_api_key:
+        return fetch_location_name_tomtom(lat, lon, tomtom_api_key)
+
+    return "Unknown location"
+
+
+def resolve_location_suggestions(query, tomtom_api_key, google_maps_api_key, limit=5):
+    if google_maps_api_key:
+        try:
+            return search_locations_google(query, google_maps_api_key, limit=limit)
+        except Exception:
+            pass
+
+    if tomtom_api_key:
+        return search_locations_by_text(query, tomtom_api_key, limit=limit)
+
+    return []
 
 
 def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
@@ -405,6 +506,7 @@ df['Cluster'] = kmeans.predict(scaled_data)
 cluster_mapping = build_cluster_mapping(kmeans)
 df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping).fillna('Unknown')
 tomtom_api_key = get_tomtom_api_key()
+google_maps_api_key = get_google_maps_api_key()
 
 if "location_candidates" not in st.session_state:
     st.session_state["location_candidates"] = []
@@ -556,15 +658,20 @@ elif page == "Predictions":
             with col2:
                 longitude = st.number_input("Longitude", value=78.4867, format="%.6f")
         else:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                location_query = st.text_input("Type location or area", value="Hyderabad")
-            with col2:
-                search_click = st.button("Search Area", use_container_width=True)
+            location_query = st.text_input(
+                "Type location or area",
+                value="Hyderabad",
+                help="Suggestions appear while typing. Google Maps is used when GOOGLE_MAPS_API_KEY is configured.",
+            )
 
-            if search_click and tomtom_api_key:
+            if len(location_query.strip()) >= 3:
                 try:
-                    st.session_state["location_candidates"] = search_locations_by_text(location_query, tomtom_api_key)
+                    st.session_state["location_candidates"] = resolve_location_suggestions(
+                        location_query,
+                        tomtom_api_key=tomtom_api_key,
+                        google_maps_api_key=google_maps_api_key,
+                        limit=8,
+                    )
                 except Exception as e:
                     st.error(f"Error searching location: {str(e)}")
 
@@ -577,7 +684,7 @@ elif page == "Predictions":
                 longitude = selected_candidate["lon"]
                 st.caption(f"Selected coordinates: {latitude:.6f}, {longitude:.6f}")
             else:
-                st.info("Search for a location to select an area on the map.")
+                st.info("Type at least 3 characters to get location suggestions.")
 
         selected_time = st.time_input(
             "Required Time of Day",
@@ -606,10 +713,16 @@ elif page == "Predictions":
             st.info(
                 "Set TOMTOM_API_KEY in Streamlit secrets for deployment, or define API_KEY in test_api.py for local testing."
             )
+            st.info("For better area names and suggestions, also set GOOGLE_MAPS_API_KEY in Streamlit secrets.")
         elif st.button("🌐 Fetch Live Data and Predict", use_container_width=True) or auto_refresh:
             try:
                 flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
-                location_name = fetch_location_name(latitude, longitude, tomtom_api_key)
+                location_name = resolve_location_name(
+                    latitude,
+                    longitude,
+                    tomtom_api_key=tomtom_api_key,
+                    google_maps_api_key=google_maps_api_key,
+                )
                 features = estimate_features_from_live_flow(flow_data, df, timezone_name)
                 features["hour"] = selected_hour
 
