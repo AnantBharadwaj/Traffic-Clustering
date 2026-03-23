@@ -3,6 +3,12 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from pathlib import Path
+from datetime import datetime
+import json
+import os
+import re
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, davies_bouldin_score
@@ -35,6 +41,41 @@ def render_page_header(title, subtitle, icon=""):
     heading = f"{icon} {title}".strip() if icon else title
     st.title(heading)
     st.caption(subtitle)
+
+
+def trigger_auto_refresh(interval_ms, key):
+    try:
+        import importlib
+
+        module = importlib.import_module("streamlit_autorefresh")
+        module.st_autorefresh(interval=interval_ms, key=key)
+        return True
+    except Exception:
+        return False
+
+
+def get_tomtom_api_key():
+    # Preferred source in deployment: Streamlit secrets.
+    try:
+        secret_key = st.secrets.get("TOMTOM_API_KEY")
+        if secret_key:
+            return str(secret_key).strip()
+    except Exception:
+        pass
+
+    env_key = os.getenv("TOMTOM_API_KEY")
+    if env_key:
+        return env_key.strip()
+
+    # Local fallback: read from test_api.py without importing executable code.
+    api_file = BASE_DIR / "test_api.py"
+    if api_file.exists():
+        text = api_file.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r'API_KEY\s*=\s*["\']([^"\']+)["\']', text)
+        if match:
+            return match.group(1).strip()
+
+    return None
 
 
 def resolve_data_file():
@@ -123,6 +164,97 @@ def compute_elbow_inertias(scaled_values, k_start=2, k_end=10):
         inertias.append(kmeans_temp.inertia_)
     return inertias
 
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_live_tomtom_flow(lat, lon, api_key):
+    params = {
+        "point": f"{lat},{lon}",
+        "key": api_key,
+    }
+    url = (
+        "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json?"
+        + urlencode(params)
+    )
+
+    with urlopen(url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if "flowSegmentData" not in payload:
+        raise ValueError(f"Unexpected API response: {payload}")
+
+    return payload["flowSegmentData"]
+
+
+def estimate_features_from_live_flow(flow_data, vc_min, vc_max):
+    current_speed = float(flow_data.get("currentSpeed", 0.0))
+    free_flow_speed = float(flow_data.get("freeFlowSpeed", current_speed if current_speed > 0 else 1.0))
+    safe_free_flow_speed = max(free_flow_speed, 1.0)
+
+    congestion_ratio = float(np.clip(1 - (current_speed / safe_free_flow_speed), 0, 1))
+    estimated_vehicle_count = int(round(vc_min + congestion_ratio * (vc_max - vc_min)))
+    current_hour = int(datetime.now().hour)
+
+    return {
+        "vehicle_count": estimated_vehicle_count,
+        "vehicle_speed": current_speed,
+        "hour": current_hour,
+        "congestion_ratio": congestion_ratio,
+        "free_flow_speed": free_flow_speed,
+    }
+
+
+def run_prediction(vehicle_count, vehicle_speed, hour, model, model_scaler, mapping):
+    new_data = [[vehicle_count, vehicle_speed, hour]]
+    new_scaled = model_scaler.transform(new_data)
+    prediction = int(model.predict(new_scaled)[0])
+
+    distance = float(np.linalg.norm(new_scaled - model.cluster_centers_[prediction]))
+    confidence = float(1 - min(distance / 10, 1))
+    condition = mapping.get(prediction, "Unknown")
+
+    return {
+        "prediction": prediction,
+        "distance": distance,
+        "confidence": confidence,
+        "condition": condition,
+    }
+
+
+def render_prediction_result(result):
+    st.markdown("---")
+    st.subheader("Prediction Result")
+
+    condition = result["condition"]
+    if condition == "Free Flow":
+        st.success(f"### ✅ Traffic Condition: {condition}", icon="✅")
+        st.write("Road is clear with smooth traffic flow. Optimal travel conditions.")
+    elif condition == "Moderate Traffic":
+        st.warning(f"### ⚠️ Traffic Condition: {condition}", icon="⚠️")
+        st.write("Moderate congestion detected. Traffic may be slightly slower than normal.")
+    else:
+        st.error(f"### 🚫 Traffic Condition: {condition}", icon="🚫")
+        st.write("Heavy congestion detected. Expect significant delays and slow traffic.")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Prediction Confidence",
+            f"{result['confidence']:.1%}",
+            help="Higher means your input is closer to the learned cluster pattern.",
+        )
+    with col2:
+        st.metric(
+            "Nearest Cluster",
+            result["prediction"],
+            help="Internal KMeans cluster number used by the model (not a traffic label by itself).",
+        )
+    with col3:
+        st.metric(
+            "Similarity Distance",
+            f"{result['distance']:.3f}",
+            help="Distance from input to the nearest cluster center in scaled feature space. Lower is better.",
+        )
+
 # Load data
 try:
     df = load_and_prepare_data()
@@ -151,6 +283,7 @@ df['Cluster'] = kmeans.predict(scaled_data)
 # Map clusters to traffic conditions dynamically (cluster IDs are not semantically fixed)
 cluster_mapping = build_cluster_mapping(kmeans)
 df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping).fillna('Unknown')
+tomtom_api_key = get_tomtom_api_key()
     
 # Sidebar Navigation
 # ----------------------------
@@ -264,7 +397,7 @@ elif page == "Predictions":
         icon="🔮",
     )
     
-    st.write("Enter traffic details to predict the traffic pattern:")
+    st.write("Choose manual values or live API flow data to predict the traffic pattern.")
 
     # Use observed data ranges so predictions stay within the model's learned domain.
     vc_min, vc_max = int(df['Vehicle_Count'].min()), int(df['Vehicle_Count'].max())
@@ -272,112 +405,136 @@ elif page == "Predictions":
     speed_max = float(df['Vehicle_Speed'].max())
     hour_min, hour_max = int(df['Hour'].min()), int(df['Hour'].max())
     
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        default_vehicle_count = int(np.clip(df['Vehicle_Count'].median(), 0, 1000))
-        vehicle_count = st.number_input(
-            "Vehicle Count",
-            min_value=0,
-            max_value=1000,
-            value=default_vehicle_count,
-            step=1,
-        )
-    
-    with col2:
-        default_vehicle_speed = float(np.clip(df['Vehicle_Speed'].median(), 0.0, 150.0))
-        vehicle_speed = st.number_input(
-            "Vehicle Speed (km/h)",
-            min_value=0.0,
-            max_value=150.0,
-            value=default_vehicle_speed,
-            step=0.1,
-        )
-    
-    with col3:
-        hour = st.slider("Hour of Day", hour_min, hour_max, value=12)
-    
-    if st.button("🎯 Predict Traffic Pattern", use_container_width=True):
-        try:
-            validation_errors = []
-            if vehicle_count <= 0:
-                validation_errors.append("Vehicle Count should be greater than 0 for a meaningful prediction.")
-            if vehicle_speed <= 0:
-                validation_errors.append("Vehicle Speed should be greater than 0 km/h.")
-            if vehicle_speed > 130:
-                st.warning("Vehicle Speed is unusually high. Prediction reliability may be lower.")
+    source_mode = st.radio(
+        "Prediction Source",
+        ["Live API", "Manual Input"],
+        horizontal=True,
+        index=0 if tomtom_api_key else 1,
+        help="Live API uses TomTom flow speed and estimates vehicle count from learned data range.",
+    )
 
-            if validation_errors:
-                for error_msg in validation_errors:
-                    st.error(error_msg)
-                st.stop()
+    if source_mode == "Live API":
+        col1, col2 = st.columns(2)
+        with col1:
+            latitude = st.number_input("Latitude", value=17.3850, format="%.6f")
+        with col2:
+            longitude = st.number_input("Longitude", value=78.4867, format="%.6f")
 
-            new_data = [[vehicle_count, vehicle_speed, hour]]
-            new_scaled = scaler.transform(new_data)
-            prediction = kmeans.predict(new_scaled)[0]
-            
-            # Distance to cluster center
-            distance = np.linalg.norm(new_scaled - kmeans.cluster_centers_[prediction])
-            confidence = (1 - min(distance / 10, 1))
-            
-            st.markdown("---")
-            st.subheader("Prediction Result")
-            
-            condition = cluster_mapping.get(int(prediction), "Unknown")
-            
-            if condition == "Free Flow":
-                st.success(f"### ✅ Traffic Condition: {condition}", icon="✅")
-                st.write("Road is clear with smooth traffic flow. Optimal travel conditions.")
-            elif condition == "Moderate Traffic":
-                st.warning(f"### ⚠️ Traffic Condition: {condition}", icon="⚠️")
-                st.write("Moderate congestion detected. Traffic may be slightly slower than normal.")
-            else:
-                st.error(f"### 🚫 Traffic Condition: {condition}", icon="🚫")
-                st.write("Heavy congestion detected. Expect significant delays and slow traffic.")
-            
-            # Additional details
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric(
-                    "Prediction Confidence",
-                    f"{confidence:.1%}",
-                    help="Higher means your input is closer to the learned cluster pattern."
-                )
-            with col2:
-                st.metric(
-                    "Nearest Cluster",
-                    prediction,
-                    help="Internal KMeans cluster number used by the model (not a traffic label by itself)."
-                )
-            with col3:
-                st.metric(
-                    "Similarity Distance",
-                    f"{distance:.3f}",
-                    help="Distance from your input to the nearest cluster center in scaled feature space. Lower is better."
-                )
+        auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=True)
+        refresh_available = False
+        if auto_refresh:
+            refresh_available = trigger_auto_refresh(interval_ms=30_000, key="live_api_refresh")
+        if auto_refresh and not refresh_available:
+            st.warning("Install streamlit-autorefresh to enable timed refresh. Use manual refresh button for now.")
 
-            # Flag inputs that are outside the range seen during training.
-            outside_training_range = (
-                vehicle_count < vc_min
-                or vehicle_count > vc_max
-                or vehicle_speed < speed_min
-                or vehicle_speed > speed_max
+        if not tomtom_api_key:
+            st.error("TomTom API key not found.")
+            st.info(
+                "Set TOMTOM_API_KEY in Streamlit secrets for deployment, or define API_KEY in test_api.py for local testing."
+            )
+        elif st.button("🌐 Fetch Live Data and Predict", use_container_width=True) or auto_refresh:
+            try:
+                flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
+                features = estimate_features_from_live_flow(flow_data, vc_min, vc_max)
+
+                st.markdown("---")
+                st.subheader("Live Data Snapshot")
+                l1, l2, l3, l4 = st.columns(4)
+                with l1:
+                    st.metric("Current Speed", f"{features['vehicle_speed']:.1f} km/h")
+                with l2:
+                    st.metric("Free Flow Speed", f"{features['free_flow_speed']:.1f} km/h")
+                with l3:
+                    st.metric("Congestion Ratio", f"{features['congestion_ratio']:.1%}")
+                with l4:
+                    st.metric("Estimated Vehicle Count", features['vehicle_count'])
+                st.caption(f"Last updated at {datetime.now().strftime('%H:%M:%S')}")
+
+                result = run_prediction(
+                    vehicle_count=features["vehicle_count"],
+                    vehicle_speed=features["vehicle_speed"],
+                    hour=features["hour"],
+                    model=kmeans,
+                    model_scaler=scaler,
+                    mapping=cluster_mapping,
+                )
+                render_prediction_result(result)
+
+                if result["confidence"] < 0.35:
+                    st.info("Low-confidence prediction: this live input is far from common patterns in the training data.")
+
+            except Exception as e:
+                st.error(f"Error fetching live API data or predicting traffic condition: {str(e)}")
+
+    else:
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            default_vehicle_count = int(np.clip(df['Vehicle_Count'].median(), 0, 1000))
+            vehicle_count = st.number_input(
+                "Vehicle Count",
+                min_value=0,
+                max_value=1000,
+                value=default_vehicle_count,
+                step=1,
             )
 
-            if outside_training_range:
-                st.warning(
-                    f"Input is outside training range (Vehicle Count: {vc_min}-{vc_max}, "
-                    f"Vehicle Speed: {speed_min:.1f}-{speed_max:.1f}). "
-                    "Prediction may be less reliable."
-                )
+        with col2:
+            default_vehicle_speed = float(np.clip(df['Vehicle_Speed'].median(), 0.0, 150.0))
+            vehicle_speed = st.number_input(
+                "Vehicle Speed (km/h)",
+                min_value=0.0,
+                max_value=150.0,
+                value=default_vehicle_speed,
+                step=0.1,
+            )
 
-            if confidence < 0.35:
-                st.info(
-                    "Low-confidence prediction: this input is far from common patterns in the training data."
-                )
-                
-        except Exception as e:
-            st.error(f"Error in prediction: {str(e)}")
+        with col3:
+            hour = st.slider("Hour of Day", hour_min, hour_max, value=12)
+
+        if st.button("🎯 Predict Traffic Pattern", use_container_width=True):
+            try:
+                validation_errors = []
+                if vehicle_count <= 0:
+                    validation_errors.append("Vehicle Count should be greater than 0 for a meaningful prediction.")
+                if vehicle_speed <= 0:
+                    validation_errors.append("Vehicle Speed should be greater than 0 km/h.")
+                if vehicle_speed > 130:
+                    st.warning("Vehicle Speed is unusually high. Prediction reliability may be lower.")
+
+                if validation_errors:
+                    for error_msg in validation_errors:
+                        st.error(error_msg)
+                else:
+                    result = run_prediction(
+                        vehicle_count=vehicle_count,
+                        vehicle_speed=vehicle_speed,
+                        hour=hour,
+                        model=kmeans,
+                        model_scaler=scaler,
+                        mapping=cluster_mapping,
+                    )
+                    render_prediction_result(result)
+
+                    outside_training_range = (
+                        vehicle_count < vc_min
+                        or vehicle_count > vc_max
+                        or vehicle_speed < speed_min
+                        or vehicle_speed > speed_max
+                    )
+
+                    if outside_training_range:
+                        st.warning(
+                            f"Input is outside training range (Vehicle Count: {vc_min}-{vc_max}, "
+                            f"Vehicle Speed: {speed_min:.1f}-{speed_max:.1f}). "
+                            "Prediction may be less reliable."
+                        )
+
+                    if result["confidence"] < 0.35:
+                        st.info("Low-confidence prediction: this input is far from common patterns in the training data.")
+
+            except Exception as e:
+                st.error(f"Error in prediction: {str(e)}")
 
 # ----------------------------
 # DATA ANALYSIS PAGE
@@ -542,6 +699,7 @@ elif page == "About":
     st.subheader("Deployment Notes")
     st.write("This Streamlit app auto-redeploys when new commits are pushed to the connected GitHub branch.")
     st.write("For reliable updates, keep app.py, requirements.txt, and at least one supported CSV dataset in the repository root.")
+    st.write("For live traffic mode, configure TOMTOM_API_KEY in Streamlit secrets.")
 
     st.subheader("Contact")
     st.write("For feature requests or issue reports, contact the project maintainer through your GitHub repository issues page.")
