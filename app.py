@@ -250,25 +250,36 @@ def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
     safe_free_flow_speed = max(free_flow_speed, 1.0)
 
     congestion_ratio = float(np.clip(1 - (current_speed / safe_free_flow_speed), 0, 1))
+    current_travel_time = float(flow_data.get("currentTravelTime", 0.0))
+    free_flow_travel_time = float(flow_data.get("freeFlowTravelTime", 0.0))
+    if free_flow_travel_time > 0:
+        travel_time_index = current_travel_time / free_flow_travel_time
+    else:
+        travel_time_index = 1.0 + congestion_ratio
 
-    # Keep live speed inside model training domain to reduce out-of-distribution bias.
+    # Map relative speed ratio into historical speed domain.
     speed_min = float(historical_df["Vehicle_Speed"].min())
     speed_max = float(historical_df["Vehicle_Speed"].max())
-    clipped_speed = float(np.clip(current_speed, speed_min, speed_max))
+    relative_speed_ratio = float(np.clip(current_speed / safe_free_flow_speed, 0.0, 1.0))
+    modeled_speed = speed_min + (relative_speed_ratio * (speed_max - speed_min))
+    clipped_speed = float(np.clip(modeled_speed, speed_min, speed_max))
 
     try:
         current_hour = int(datetime.now(ZoneInfo(timezone_name)).hour)
     except Exception:
         current_hour = int(datetime.now().hour)
 
-    temp_df = historical_df.copy()
-    hour_distance = (temp_df["Hour"] - current_hour).abs()
-    hour_distance = np.minimum(hour_distance, 24 - hour_distance)
-    speed_distance = (temp_df["Vehicle_Speed"] - clipped_speed).abs()
+    hour_profiles = historical_df[historical_df["Hour"] == current_hour]
+    if hour_profiles.empty:
+        hour_profiles = historical_df
 
-    temp_df["_distance"] = speed_distance + (2.5 * hour_distance)
-    nearest_profiles = temp_df.nsmallest(20, "_distance")
-    estimated_vehicle_count = int(round(float(nearest_profiles["Vehicle_Count"].median())))
+    base_count = float(hour_profiles["Vehicle_Count"].median())
+    lower_count = float(hour_profiles["Vehicle_Count"].quantile(0.2))
+    upper_count = float(hour_profiles["Vehicle_Count"].quantile(0.8))
+    spread = max(upper_count - lower_count, 1.0)
+
+    estimated_vehicle_count = int(round(base_count + ((congestion_ratio - 0.5) * spread)))
+    estimated_vehicle_count = int(np.clip(estimated_vehicle_count, historical_df["Vehicle_Count"].min(), historical_df["Vehicle_Count"].max()))
 
     return {
         "vehicle_count": estimated_vehicle_count,
@@ -279,7 +290,21 @@ def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
         "free_flow_speed": free_flow_speed,
         "speed_was_clipped": bool(clipped_speed != current_speed),
         "speed_clip_range": (speed_min, speed_max),
+        "travel_time_index": float(travel_time_index),
+        "relative_speed_ratio": relative_speed_ratio,
     }
+
+
+def calibrate_condition_with_live_index(model_condition, congestion_ratio, travel_time_index):
+    if travel_time_index <= 1.10 and congestion_ratio <= 0.20:
+        return "Free Flow"
+    if travel_time_index <= 1.35 and congestion_ratio <= 0.45:
+        if model_condition == "Heavy Congestion":
+            return "Moderate Traffic"
+        return model_condition
+    if travel_time_index >= 1.70 or congestion_ratio >= 0.65:
+        return "Heavy Congestion"
+    return model_condition
 
 
 def run_prediction(vehicle_count, vehicle_speed, hour, model, model_scaler, mapping):
@@ -604,6 +629,11 @@ elif page == "Predictions":
                     st.metric("Congestion Ratio", f"{features['congestion_ratio']:.1%}")
                 with l4:
                     st.metric("Estimated Vehicle Count", features['vehicle_count'])
+                m1, m2 = st.columns(2)
+                with m1:
+                    st.metric("Travel Time Index", f"{features['travel_time_index']:.2f}")
+                with m2:
+                    st.metric("Relative Speed Ratio", f"{features['relative_speed_ratio']:.2f}")
                 st.caption(f"Last updated at {datetime.now().strftime('%H:%M:%S')}")
                 st.caption(
                     f"Live feature hour uses selected time: {selected_time.strftime('%H:%M')} (hour={features['hour']})."
@@ -626,6 +656,11 @@ elif page == "Predictions":
                     model=kmeans,
                     model_scaler=scaler,
                     mapping=cluster_mapping,
+                )
+                result["condition"] = calibrate_condition_with_live_index(
+                    model_condition=result["condition"],
+                    congestion_ratio=features["congestion_ratio"],
+                    travel_time_index=features["travel_time_index"],
                 )
                 render_prediction_result(result)
 
