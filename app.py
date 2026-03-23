@@ -166,6 +166,21 @@ def compute_elbow_inertias(scaled_values, k_start=2, k_end=10):
     return inertias
 
 
+@st.cache_data(show_spinner=False)
+def compute_hourly_congestion_baseline(historical_df):
+    temp = historical_df.copy()
+    temp["count_norm"] = (temp["Vehicle_Count"] - temp["Vehicle_Count"].min()) / (
+        max(temp["Vehicle_Count"].max() - temp["Vehicle_Count"].min(), 1e-6)
+    )
+    temp["speed_norm"] = (temp["Vehicle_Speed"] - temp["Vehicle_Speed"].min()) / (
+        max(temp["Vehicle_Speed"].max() - temp["Vehicle_Speed"].min(), 1e-6)
+    )
+    temp["hour_congestion"] = (0.65 * temp["count_norm"]) + (0.35 * (1 - temp["speed_norm"]))
+
+    baseline = temp.groupby("Hour")["hour_congestion"].mean().to_dict()
+    return {int(k): float(v) for k, v in baseline.items()}
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_tomtom_flow(lat, lon, api_key):
     params = {
@@ -295,16 +310,25 @@ def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
     }
 
 
-def calibrate_condition_with_live_index(model_condition, congestion_ratio, travel_time_index):
-    if travel_time_index <= 1.10 and congestion_ratio <= 0.20:
-        return "Free Flow"
-    if travel_time_index <= 1.35 and congestion_ratio <= 0.45:
-        if model_condition == "Heavy Congestion":
-            return "Moderate Traffic"
-        return model_condition
-    if travel_time_index >= 1.70 or congestion_ratio >= 0.65:
-        return "Heavy Congestion"
-    return model_condition
+def calibrate_condition_with_live_index(model_condition, congestion_ratio, travel_time_index, selected_hour, hourly_baseline):
+    model_score_map = {
+        "Free Flow": 0.20,
+        "Moderate Traffic": 0.52,
+        "Heavy Congestion": 0.82,
+        "Unknown": 0.50,
+    }
+    model_score = model_score_map.get(model_condition, 0.50)
+
+    travel_index_score = float(np.clip((travel_time_index - 1.0) / 0.9, 0.0, 1.0))
+    hour_score = float(hourly_baseline.get(int(selected_hour), 0.50))
+    live_signal_score = (0.55 * float(congestion_ratio)) + (0.35 * travel_index_score) + (0.10 * hour_score)
+    final_score = (0.65 * live_signal_score) + (0.35 * model_score)
+
+    if final_score < 0.36:
+        return "Free Flow", final_score
+    if final_score < 0.66:
+        return "Moderate Traffic", final_score
+    return "Heavy Congestion", final_score
 
 
 def run_prediction(vehicle_count, vehicle_speed, hour, model, model_scaler, mapping):
@@ -405,6 +429,7 @@ df['Cluster'] = kmeans.predict(scaled_data)
 # Map clusters to traffic conditions dynamically (cluster IDs are not semantically fixed)
 cluster_mapping = build_cluster_mapping(kmeans)
 df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping).fillna('Unknown')
+hourly_congestion_baseline = compute_hourly_congestion_baseline(df)
 tomtom_api_key = get_tomtom_api_key()
 
 if "location_candidates" not in st.session_state:
@@ -657,12 +682,21 @@ elif page == "Predictions":
                     model_scaler=scaler,
                     mapping=cluster_mapping,
                 )
-                result["condition"] = calibrate_condition_with_live_index(
+                calibrated_condition, calibrated_score = calibrate_condition_with_live_index(
                     model_condition=result["condition"],
                     congestion_ratio=features["congestion_ratio"],
                     travel_time_index=features["travel_time_index"],
+                    selected_hour=features["hour"],
+                    hourly_baseline=hourly_congestion_baseline,
                 )
+                result["model_condition"] = result["condition"]
+                result["condition"] = calibrated_condition
+                result["calibrated_score"] = float(calibrated_score)
                 render_prediction_result(result)
+                st.caption(
+                    f"Model condition: {result['model_condition']} | Live calibrated condition: {result['condition']} "
+                    f"(score={result['calibrated_score']:.2f})"
+                )
 
                 timeline_now = datetime.now(ZoneInfo(timezone_name))
                 entry = {
@@ -675,6 +709,7 @@ elif page == "Predictions":
                     "confidence": float(result["confidence"]),
                     "speed": float(features["raw_vehicle_speed"]),
                     "estimated_count": int(features["vehicle_count"]),
+                    "calibrated_score": float(result["calibrated_score"]),
                 }
 
                 history = st.session_state.get("live_prediction_history", [])
@@ -690,33 +725,66 @@ elif page == "Predictions":
                     history_df["condition_code"] = history_df["condition"].map(order_map).fillna(3)
                     history_df["captured_at"] = pd.to_datetime(history_df["captured_at"], errors="coerce")
                     history_df = history_df.dropna(subset=["captured_at"]).sort_values("captured_at")
+                    history_df["time_label"] = history_df["captured_at"].dt.strftime("%d %b %H:%M")
+                    time_order = history_df["time_label"].tolist()
+
+                    st.subheader("Live Timeline (Last 10, 30-Min Spacing)")
+                    st.caption(
+                        "Each point represents one stored live prediction sampled at least 30 minutes apart. "
+                        "Hover a point to see condition, location, speed, estimated count, and confidence."
+                    )
 
                     timeline_fig = px.line(
                         history_df,
-                        x="captured_at",
+                        x="time_label",
                         y="condition_code",
                         markers=True,
-                        title="Last 10 Live Predictions Timeline",
-                        custom_data=["condition", "location", "speed", "estimated_count", "confidence"],
+                        title="Traffic Condition Over Time",
+                        custom_data=["condition", "location", "speed", "estimated_count", "confidence", "calibrated_score"],
                     )
                     timeline_fig.update_traces(
                         hovertemplate=(
-                            "Time: %{x|%Y-%m-%d %H:%M}<br>"
+                            "Time: %{x}<br>"
                             "Condition: %{customdata[0]}<br>"
                             "Location: %{customdata[1]}<br>"
                             "Speed: %{customdata[2]:.1f} km/h<br>"
                             "Estimated Count: %{customdata[3]}<br>"
-                            "Confidence: %{customdata[4]:.1%}<extra></extra>"
+                            "Confidence: %{customdata[4]:.1%}<br>"
+                            "Congestion Score: %{customdata[5]:.2f}<extra></extra>"
                         )
                     )
                     timeline_fig.update_yaxes(
                         tickmode="array",
                         tickvals=[0, 1, 2, 3],
                         ticktext=["Free Flow", "Moderate", "Heavy", "Unknown"],
+                        fixedrange=True,
                         title="Predicted Condition",
                     )
-                    timeline_fig.update_layout(height=360, **CHART_LAYOUT)
-                    st.plotly_chart(timeline_fig, use_container_width=True)
+                    timeline_fig.update_xaxes(
+                        categoryorder="array",
+                        categoryarray=time_order,
+                        fixedrange=True,
+                        title="Time",
+                    )
+                    timeline_fig.update_layout(height=360, dragmode=False, **CHART_LAYOUT)
+                    st.plotly_chart(
+                        timeline_fig,
+                        use_container_width=True,
+                        config={"scrollZoom": False, "displaylogo": False, "doubleClick": "reset"},
+                    )
+
+                    summary_view = history_df[["time_label", "condition", "location", "speed", "estimated_count", "confidence"]].copy()
+                    summary_view = summary_view.rename(
+                        columns={
+                            "time_label": "Time",
+                            "condition": "Condition",
+                            "location": "Location",
+                            "speed": "Speed (km/h)",
+                            "estimated_count": "Estimated Vehicle Count",
+                            "confidence": "Confidence",
+                        }
+                    )
+                    st.dataframe(summary_view.tail(10), use_container_width=True, hide_index=True)
 
                 if result["confidence"] < 0.35:
                     st.info("Low-confidence prediction: this live input is far from common patterns in the training data.")
