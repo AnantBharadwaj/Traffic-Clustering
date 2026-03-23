@@ -8,7 +8,7 @@ import json
 import os
 import re
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from urllib.request import urlopen
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -214,6 +214,36 @@ def fetch_location_name(lat, lon, api_key):
     return fallback if fallback else "Unknown location"
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def search_locations_by_text(query, api_key, limit=5):
+    q = query.strip()
+    if not q:
+        return []
+
+    url = (
+        "https://api.tomtom.com/search/2/geocode/"
+        + quote(q, safe="")
+        + ".json?"
+        + urlencode({"key": api_key, "limit": limit})
+    )
+
+    with urlopen(url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    results = []
+    for item in payload.get("results", []):
+        position = item.get("position", {})
+        address = item.get("address", {})
+        lat = position.get("lat")
+        lon = position.get("lon")
+        if lat is None or lon is None:
+            continue
+        label = address.get("freeformAddress", "Unknown location")
+        results.append({"label": label, "lat": float(lat), "lon": float(lon)})
+
+    return results
+
+
 def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
     current_speed = float(flow_data.get("currentSpeed", 0.0))
     free_flow_speed = float(flow_data.get("freeFlowSpeed", current_speed if current_speed > 0 else 1.0))
@@ -333,6 +363,11 @@ df['Cluster'] = kmeans.predict(scaled_data)
 cluster_mapping = build_cluster_mapping(kmeans)
 df['Traffic_Condition'] = df['Cluster'].map(cluster_mapping).fillna('Unknown')
 tomtom_api_key = get_tomtom_api_key()
+
+if "location_candidates" not in st.session_state:
+    st.session_state["location_candidates"] = []
+if "live_prediction_history" not in st.session_state:
+    st.session_state["live_prediction_history"] = []
     
 # Sidebar Navigation
 # ----------------------------
@@ -463,11 +498,44 @@ elif page == "Predictions":
     )
 
     if source_mode == "Live API":
-        col1, col2 = st.columns(2)
-        with col1:
-            latitude = st.number_input("Latitude", value=17.3850, format="%.6f")
-        with col2:
-            longitude = st.number_input("Longitude", value=78.4867, format="%.6f")
+        coord_mode = st.radio(
+            "Location Input Mode",
+            ["Manual Coordinates", "Search by Location Name"],
+            horizontal=True,
+        )
+
+        latitude = 17.3850
+        longitude = 78.4867
+
+        if coord_mode == "Manual Coordinates":
+            col1, col2 = st.columns(2)
+            with col1:
+                latitude = st.number_input("Latitude", value=17.3850, format="%.6f")
+            with col2:
+                longitude = st.number_input("Longitude", value=78.4867, format="%.6f")
+        else:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                location_query = st.text_input("Type location or area", value="Hyderabad")
+            with col2:
+                search_click = st.button("Search Area", use_container_width=True)
+
+            if search_click and tomtom_api_key:
+                try:
+                    st.session_state["location_candidates"] = search_locations_by_text(location_query, tomtom_api_key)
+                except Exception as e:
+                    st.error(f"Error searching location: {str(e)}")
+
+            candidates = st.session_state.get("location_candidates", [])
+            if candidates:
+                option_labels = [c["label"] for c in candidates]
+                selected_label = st.selectbox("Select area from results", option_labels)
+                selected_candidate = next((c for c in candidates if c["label"] == selected_label), candidates[0])
+                latitude = selected_candidate["lat"]
+                longitude = selected_candidate["lon"]
+                st.caption(f"Selected coordinates: {latitude:.6f}, {longitude:.6f}")
+            else:
+                st.info("Search for a location to select an area on the map.")
 
         timezone_name = st.selectbox(
             "Timezone",
@@ -533,6 +601,53 @@ elif page == "Predictions":
                     mapping=cluster_mapping,
                 )
                 render_prediction_result(result)
+
+                history = st.session_state.get("live_prediction_history", [])
+                history.append(
+                    {
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "location": location_name,
+                        "lat": latitude,
+                        "lon": longitude,
+                        "condition": result["condition"],
+                        "confidence": float(result["confidence"]),
+                        "speed": float(features["raw_vehicle_speed"]),
+                        "estimated_count": int(features["vehicle_count"]),
+                    }
+                )
+                st.session_state["live_prediction_history"] = history[-10:]
+
+                history_df = pd.DataFrame(st.session_state["live_prediction_history"])
+                if not history_df.empty:
+                    order_map = {"Free Flow": 0, "Moderate Traffic": 1, "Heavy Congestion": 2, "Unknown": 3}
+                    history_df["condition_code"] = history_df["condition"].map(order_map).fillna(3)
+
+                    timeline_fig = px.line(
+                        history_df,
+                        x="timestamp",
+                        y="condition_code",
+                        markers=True,
+                        title="Last 10 Live Predictions Timeline",
+                        custom_data=["condition", "location", "speed", "estimated_count", "confidence"],
+                    )
+                    timeline_fig.update_traces(
+                        hovertemplate=(
+                            "Time: %{x}<br>"
+                            "Condition: %{customdata[0]}<br>"
+                            "Location: %{customdata[1]}<br>"
+                            "Speed: %{customdata[2]:.1f} km/h<br>"
+                            "Estimated Count: %{customdata[3]}<br>"
+                            "Confidence: %{customdata[4]:.1%}<extra></extra>"
+                        )
+                    )
+                    timeline_fig.update_yaxes(
+                        tickmode="array",
+                        tickvals=[0, 1, 2, 3],
+                        ticktext=["Free Flow", "Moderate", "Heavy", "Unknown"],
+                        title="Predicted Condition",
+                    )
+                    timeline_fig.update_layout(height=360, **CHART_LAYOUT)
+                    st.plotly_chart(timeline_fig, use_container_width=True)
 
                 if result["confidence"] < 0.35:
                     st.info("Low-confidence prediction: this live input is far from common patterns in the training data.")
