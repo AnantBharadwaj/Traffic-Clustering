@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import os
 import re
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from sklearn.preprocessing import StandardScaler
@@ -172,7 +173,7 @@ def fetch_live_tomtom_flow(lat, lon, api_key):
         "key": api_key,
     }
     url = (
-        "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json?"
+        "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/22/json?"
         + urlencode(params)
     )
 
@@ -213,21 +214,41 @@ def fetch_location_name(lat, lon, api_key):
     return fallback if fallback else "Unknown location"
 
 
-def estimate_features_from_live_flow(flow_data, vc_min, vc_max):
+def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
     current_speed = float(flow_data.get("currentSpeed", 0.0))
     free_flow_speed = float(flow_data.get("freeFlowSpeed", current_speed if current_speed > 0 else 1.0))
     safe_free_flow_speed = max(free_flow_speed, 1.0)
 
     congestion_ratio = float(np.clip(1 - (current_speed / safe_free_flow_speed), 0, 1))
-    estimated_vehicle_count = int(round(vc_min + congestion_ratio * (vc_max - vc_min)))
-    current_hour = int(datetime.now().hour)
+
+    # Keep live speed inside model training domain to reduce out-of-distribution bias.
+    speed_min = float(historical_df["Vehicle_Speed"].min())
+    speed_max = float(historical_df["Vehicle_Speed"].max())
+    clipped_speed = float(np.clip(current_speed, speed_min, speed_max))
+
+    try:
+        current_hour = int(datetime.now(ZoneInfo(timezone_name)).hour)
+    except Exception:
+        current_hour = int(datetime.now().hour)
+
+    temp_df = historical_df.copy()
+    hour_distance = (temp_df["Hour"] - current_hour).abs()
+    hour_distance = np.minimum(hour_distance, 24 - hour_distance)
+    speed_distance = (temp_df["Vehicle_Speed"] - clipped_speed).abs()
+
+    temp_df["_distance"] = speed_distance + (2.5 * hour_distance)
+    nearest_profiles = temp_df.nsmallest(20, "_distance")
+    estimated_vehicle_count = int(round(float(nearest_profiles["Vehicle_Count"].median())))
 
     return {
         "vehicle_count": estimated_vehicle_count,
-        "vehicle_speed": current_speed,
+        "vehicle_speed": clipped_speed,
+        "raw_vehicle_speed": current_speed,
         "hour": current_hour,
         "congestion_ratio": congestion_ratio,
         "free_flow_speed": free_flow_speed,
+        "speed_was_clipped": bool(clipped_speed != current_speed),
+        "speed_clip_range": (speed_min, speed_max),
     }
 
 
@@ -448,6 +469,13 @@ elif page == "Predictions":
         with col2:
             longitude = st.number_input("Longitude", value=78.4867, format="%.6f")
 
+        timezone_name = st.selectbox(
+            "Timezone",
+            ["Asia/Kolkata", "UTC", "Europe/London", "America/New_York", "Asia/Dubai"],
+            index=0,
+            help="Used to derive local hour feature for live prediction.",
+        )
+
         auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=True)
         refresh_available = False
         if auto_refresh:
@@ -464,7 +492,7 @@ elif page == "Predictions":
             try:
                 flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
                 location_name = fetch_location_name(latitude, longitude, tomtom_api_key)
-                features = estimate_features_from_live_flow(flow_data, vc_min, vc_max)
+                features = estimate_features_from_live_flow(flow_data, df, timezone_name)
 
                 st.markdown("---")
                 st.subheader("Location")
@@ -474,7 +502,7 @@ elif page == "Predictions":
                 st.subheader("Live Data Snapshot")
                 l1, l2, l3, l4 = st.columns(4)
                 with l1:
-                    st.metric("Current Speed", f"{features['vehicle_speed']:.1f} km/h")
+                    st.metric("Current Speed", f"{features['raw_vehicle_speed']:.1f} km/h")
                 with l2:
                     st.metric("Free Flow Speed", f"{features['free_flow_speed']:.1f} km/h")
                 with l3:
@@ -482,6 +510,19 @@ elif page == "Predictions":
                 with l4:
                     st.metric("Estimated Vehicle Count", features['vehicle_count'])
                 st.caption(f"Last updated at {datetime.now().strftime('%H:%M:%S')}")
+                st.caption(
+                    f"Live feature hour uses timezone: {timezone_name} (hour={features['hour']})."
+                )
+                st.caption(
+                    "Note: provider traffic timestamp is not exposed by this endpoint; shown time is fetch time."
+                )
+
+                if features["speed_was_clipped"]:
+                    min_spd, max_spd = features["speed_clip_range"]
+                    st.info(
+                        f"Current speed was clipped to model range ({min_spd:.1f}-{max_spd:.1f} km/h) "
+                        "for stable prediction."
+                    )
 
                 result = run_prediction(
                     vehicle_count=features["vehicle_count"],
