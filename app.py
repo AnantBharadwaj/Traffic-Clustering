@@ -299,6 +299,24 @@ def run_prediction(vehicle_count, vehicle_speed, hour, model, model_scaler, mapp
     }
 
 
+def update_live_prediction_history(history, entry, min_gap_minutes=30):
+    if not history:
+        return [entry], True
+
+    last_entry = history[-1]
+    try:
+        last_time = datetime.fromisoformat(last_entry["captured_at"])
+        current_time = datetime.fromisoformat(entry["captured_at"])
+    except Exception:
+        return history + [entry], True
+
+    gap_minutes = (current_time - last_time).total_seconds() / 60.0
+    if gap_minutes >= min_gap_minutes:
+        return (history + [entry])[-10:], True
+
+    return history, False
+
+
 def render_prediction_result(result):
     st.markdown("---")
     st.subheader("Prediction Result")
@@ -537,6 +555,14 @@ elif page == "Predictions":
             else:
                 st.info("Search for a location to select an area on the map.")
 
+        selected_time = st.time_input(
+            "Required Time of Day",
+            value=datetime.now().time().replace(second=0, microsecond=0),
+            step=1800,
+            help="Prediction hour will use this selected time instead of current system time.",
+        )
+        selected_hour = int(selected_time.hour)
+
         timezone_name = st.selectbox(
             "Timezone",
             ["Asia/Kolkata", "UTC", "Europe/London", "America/New_York", "Asia/Dubai"],
@@ -561,6 +587,7 @@ elif page == "Predictions":
                 flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
                 location_name = fetch_location_name(latitude, longitude, tomtom_api_key)
                 features = estimate_features_from_live_flow(flow_data, df, timezone_name)
+                features["hour"] = selected_hour
 
                 st.markdown("---")
                 st.subheader("Location")
@@ -579,7 +606,7 @@ elif page == "Predictions":
                     st.metric("Estimated Vehicle Count", features['vehicle_count'])
                 st.caption(f"Last updated at {datetime.now().strftime('%H:%M:%S')}")
                 st.caption(
-                    f"Live feature hour uses timezone: {timezone_name} (hour={features['hour']})."
+                    f"Live feature hour uses selected time: {selected_time.strftime('%H:%M')} (hour={features['hour']})."
                 )
                 st.caption(
                     "Note: provider traffic timestamp is not exposed by this endpoint; shown time is fetch time."
@@ -602,29 +629,36 @@ elif page == "Predictions":
                 )
                 render_prediction_result(result)
 
+                timeline_now = datetime.now(ZoneInfo(timezone_name))
+                entry = {
+                    "timestamp": timeline_now.strftime("%H:%M"),
+                    "captured_at": timeline_now.isoformat(),
+                    "location": location_name,
+                    "lat": latitude,
+                    "lon": longitude,
+                    "condition": result["condition"],
+                    "confidence": float(result["confidence"]),
+                    "speed": float(features["raw_vehicle_speed"]),
+                    "estimated_count": int(features["vehicle_count"]),
+                }
+
                 history = st.session_state.get("live_prediction_history", [])
-                history.append(
-                    {
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "location": location_name,
-                        "lat": latitude,
-                        "lon": longitude,
-                        "condition": result["condition"],
-                        "confidence": float(result["confidence"]),
-                        "speed": float(features["raw_vehicle_speed"]),
-                        "estimated_count": int(features["vehicle_count"]),
-                    }
-                )
-                st.session_state["live_prediction_history"] = history[-10:]
+                updated_history, was_added = update_live_prediction_history(history, entry, min_gap_minutes=30)
+                st.session_state["live_prediction_history"] = updated_history
+
+                if not was_added:
+                    st.info("Timeline is recorded at 30-minute intervals. Next point will be added after 30 minutes.")
 
                 history_df = pd.DataFrame(st.session_state["live_prediction_history"])
                 if not history_df.empty:
                     order_map = {"Free Flow": 0, "Moderate Traffic": 1, "Heavy Congestion": 2, "Unknown": 3}
                     history_df["condition_code"] = history_df["condition"].map(order_map).fillna(3)
+                    history_df["captured_at"] = pd.to_datetime(history_df["captured_at"], errors="coerce")
+                    history_df = history_df.dropna(subset=["captured_at"]).sort_values("captured_at")
 
                     timeline_fig = px.line(
                         history_df,
-                        x="timestamp",
+                        x="captured_at",
                         y="condition_code",
                         markers=True,
                         title="Last 10 Live Predictions Timeline",
@@ -632,7 +666,7 @@ elif page == "Predictions":
                     )
                     timeline_fig.update_traces(
                         hovertemplate=(
-                            "Time: %{x}<br>"
+                            "Time: %{x|%Y-%m-%d %H:%M}<br>"
                             "Condition: %{customdata[0]}<br>"
                             "Location: %{customdata[1]}<br>"
                             "Speed: %{customdata[2]:.1f} km/h<br>"
