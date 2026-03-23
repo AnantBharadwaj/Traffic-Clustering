@@ -7,7 +7,6 @@ from datetime import datetime
 import json
 import os
 import re
-from zoneinfo import ZoneInfo
 from urllib.parse import urlencode, quote
 from urllib.request import urlopen
 from sklearn.preprocessing import StandardScaler
@@ -247,14 +246,22 @@ def fetch_location_name_google(lat, lon, api_key):
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def search_locations_google(query, api_key, limit=5):
+def search_locations_google(query, api_key, limit=5, country_code="in"):
     q = query.strip()
     if not q:
         return []
 
     auto_url = (
         "https://maps.googleapis.com/maps/api/place/autocomplete/json?"
-        + urlencode({"input": q, "types": "geocode", "key": api_key})
+        + urlencode(
+            {
+                "input": q,
+                "types": "geocode",
+                "components": f"country:{country_code.lower()}",
+                "region": country_code.lower(),
+                "key": api_key,
+            }
+        )
     )
 
     with urlopen(auto_url, timeout=15) as response:
@@ -290,7 +297,7 @@ def search_locations_google(query, api_key, limit=5):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def search_locations_by_text(query, api_key, limit=5):
+def search_locations_by_text(query, api_key, limit=5, country_set="IN"):
     q = query.strip()
     if not q:
         return []
@@ -299,7 +306,7 @@ def search_locations_by_text(query, api_key, limit=5):
         "https://api.tomtom.com/search/2/geocode/"
         + quote(q, safe="")
         + ".json?"
-        + urlencode({"key": api_key, "limit": limit})
+        + urlencode({"key": api_key, "limit": limit, "countrySet": country_set})
     )
 
     with urlopen(url, timeout=15) as response:
@@ -332,20 +339,20 @@ def resolve_location_name(lat, lon, tomtom_api_key, google_maps_api_key):
     return "Unknown location"
 
 
-def resolve_location_suggestions(query, tomtom_api_key, google_maps_api_key, limit=5):
+def resolve_location_suggestions(query, tomtom_api_key, google_maps_api_key, limit=5, country_code="in"):
     if google_maps_api_key:
         try:
-            return search_locations_google(query, google_maps_api_key, limit=limit)
+            return search_locations_google(query, google_maps_api_key, limit=limit, country_code=country_code)
         except Exception:
             pass
 
     if tomtom_api_key:
-        return search_locations_by_text(query, tomtom_api_key, limit=limit)
+        return search_locations_by_text(query, tomtom_api_key, limit=limit, country_set=country_code.upper())
 
     return []
 
 
-def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
+def estimate_features_from_live_flow(flow_data, historical_df, selected_hour):
     current_speed = float(flow_data.get("currentSpeed", 0.0))
     free_flow_speed = float(flow_data.get("freeFlowSpeed", current_speed if current_speed > 0 else 1.0))
     safe_free_flow_speed = max(free_flow_speed, 1.0)
@@ -365,10 +372,7 @@ def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
     modeled_speed = speed_min + (relative_speed_ratio * (speed_max - speed_min))
     clipped_speed = float(np.clip(modeled_speed, speed_min, speed_max))
 
-    try:
-        current_hour = int(datetime.now(ZoneInfo(timezone_name)).hour)
-    except Exception:
-        current_hour = int(datetime.now().hour)
+    current_hour = int(selected_hour)
 
     hour_profiles = historical_df[historical_df["Hour"] == current_hour]
     if hour_profiles.empty:
@@ -397,14 +401,15 @@ def estimate_features_from_live_flow(flow_data, historical_df, timezone_name):
 
 
 def derive_live_condition_from_index(travel_time_index, congestion_ratio, fallback_condition):
-    # Keep live classification simple and explainable for users.
-    if travel_time_index >= 1.45 or congestion_ratio >= 0.60:
-        return "Heavy Congestion"
-    if travel_time_index >= 1.15 or congestion_ratio >= 0.30:
-        return "Moderate Traffic"
-    if travel_time_index > 0 and congestion_ratio >= 0:
-        return "Free Flow"
-    return fallback_condition
+    # Direct real-time condition from live API indices (explainable thresholds).
+    if travel_time_index <= 0 or congestion_ratio < 0:
+        return fallback_condition, "Live indices unavailable, using model fallback."
+
+    if travel_time_index >= 1.55 or congestion_ratio >= 0.55:
+        return "Heavy Congestion", "High delay and congestion ratio from live API."
+    if travel_time_index >= 1.18 or congestion_ratio >= 0.22:
+        return "Moderate Traffic", "Moderate delay/congestion observed from live API."
+    return "Free Flow", "Low delay and low congestion ratio from live API."
 
 
 def run_prediction(vehicle_count, vehicle_speed, hour, model, model_scaler, mapping):
@@ -650,6 +655,7 @@ elif page == "Predictions":
 
         latitude = 17.3850
         longitude = 78.4867
+        has_valid_location = True
 
         if coord_mode == "Manual Coordinates":
             col1, col2 = st.columns(2)
@@ -671,6 +677,7 @@ elif page == "Predictions":
                         tomtom_api_key=tomtom_api_key,
                         google_maps_api_key=google_maps_api_key,
                         limit=8,
+                        country_code="in",
                     )
                 except Exception as e:
                     st.error(f"Error searching location: {str(e)}")
@@ -685,6 +692,7 @@ elif page == "Predictions":
                 st.caption(f"Selected coordinates: {latitude:.6f}, {longitude:.6f}")
             else:
                 st.info("Type at least 3 characters to get location suggestions.")
+                has_valid_location = False
 
         selected_time = st.time_input(
             "Required Time of Day",
@@ -693,13 +701,6 @@ elif page == "Predictions":
             help="Prediction hour will use this selected time instead of current system time.",
         )
         selected_hour = int(selected_time.hour)
-
-        timezone_name = st.selectbox(
-            "Timezone",
-            ["Asia/Kolkata", "UTC", "Europe/London", "America/New_York", "Asia/Dubai"],
-            index=0,
-            help="Used to derive local hour feature for live prediction.",
-        )
 
         auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=True)
         refresh_available = False
@@ -714,7 +715,7 @@ elif page == "Predictions":
                 "Set TOMTOM_API_KEY in Streamlit secrets for deployment, or define API_KEY in test_api.py for local testing."
             )
             st.info("For better area names and suggestions, also set GOOGLE_MAPS_API_KEY in Streamlit secrets.")
-        elif st.button("🌐 Fetch Live Data and Predict", use_container_width=True) or auto_refresh:
+        elif has_valid_location:
             try:
                 flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
                 location_name = resolve_location_name(
@@ -723,7 +724,7 @@ elif page == "Predictions":
                     tomtom_api_key=tomtom_api_key,
                     google_maps_api_key=google_maps_api_key,
                 )
-                features = estimate_features_from_live_flow(flow_data, df, timezone_name)
+                features = estimate_features_from_live_flow(flow_data, df, selected_hour)
                 features["hour"] = selected_hour
 
                 st.markdown("---")
@@ -769,14 +770,16 @@ elif page == "Predictions":
                     model_scaler=scaler,
                     mapping=cluster_mapping,
                 )
-                result["condition"] = derive_live_condition_from_index(
+                live_condition, live_reason = derive_live_condition_from_index(
                     travel_time_index=features["travel_time_index"],
                     congestion_ratio=features["congestion_ratio"],
                     fallback_condition=result["condition"],
                 )
+                result["condition"] = live_condition
                 render_prediction_result(result)
+                st.info(f"Live condition basis: {live_reason}")
 
-                timeline_now = datetime.now(ZoneInfo(timezone_name))
+                timeline_now = datetime.now()
                 entry = {
                     "timestamp": timeline_now.strftime("%H:%M"),
                     "captured_at": timeline_now.isoformat(),
@@ -827,6 +830,8 @@ elif page == "Predictions":
 
             except Exception as e:
                 st.error(f"Error fetching live API data or predicting traffic condition: {str(e)}")
+        else:
+            st.info("Select a valid India location from suggestions to fetch live traffic condition.")
 
     else:
         col1, col2, col3 = st.columns(3)
