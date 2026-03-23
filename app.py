@@ -185,6 +185,34 @@ def fetch_live_tomtom_flow(lat, lon, api_key):
     return payload["flowSegmentData"]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_location_name(lat, lon, api_key):
+    url = (
+        f"https://api.tomtom.com/search/2/reverseGeocode/{lat},{lon}.json?"
+        + urlencode({"key": api_key})
+    )
+
+    with urlopen(url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    addresses = payload.get("addresses", [])
+    if not addresses:
+        return "Unknown location"
+
+    address_data = addresses[0].get("address", {})
+    freeform = address_data.get("freeformAddress")
+    if freeform:
+        return freeform
+
+    parts = [
+        address_data.get("municipality"),
+        address_data.get("countrySubdivision"),
+        address_data.get("countryCodeISO3"),
+    ]
+    fallback = ", ".join([part for part in parts if part])
+    return fallback if fallback else "Unknown location"
+
+
 def estimate_features_from_live_flow(flow_data, vc_min, vc_max):
     current_speed = float(flow_data.get("currentSpeed", 0.0))
     free_flow_speed = float(flow_data.get("freeFlowSpeed", current_speed if current_speed > 0 else 1.0))
@@ -435,9 +463,14 @@ elif page == "Predictions":
         elif st.button("🌐 Fetch Live Data and Predict", use_container_width=True) or auto_refresh:
             try:
                 flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
+                location_name = fetch_location_name(latitude, longitude, tomtom_api_key)
                 features = estimate_features_from_live_flow(flow_data, vc_min, vc_max)
 
                 st.markdown("---")
+                st.subheader("Location")
+                st.write(f"{location_name}")
+                st.map(pd.DataFrame({"lat": [latitude], "lon": [longitude]}), use_container_width=True)
+
                 st.subheader("Live Data Snapshot")
                 l1, l2, l3, l4 = st.columns(4)
                 with l1:
