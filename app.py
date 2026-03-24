@@ -500,8 +500,19 @@ def get_live_threshold_profile(profile_name):
     return profiles.get(profile_name, profiles["Balanced"])
 
 
-def derive_live_condition_with_profile(travel_time_index, congestion_ratio, fallback_condition, profile_name):
+def is_free_flow_override_hour(hour_value):
+    # User-requested fixed windows for forcing Free Flow.
+    return (
+        hour_value in {22, 23, 0, 1, 2, 3, 4, 5, 6, 7}
+        or hour_value in {12, 13, 14}
+    )
+
+
+def derive_live_condition_with_profile(travel_time_index, congestion_ratio, fallback_condition, profile_name, selected_hour=None):
     # Direct real-time condition from live API indices with configurable sensitivity.
+    if selected_hour is not None and is_free_flow_override_hour(int(selected_hour)):
+        return "Free Flow", "Time-based override applied for configured free-flow hours."
+
     if travel_time_index <= 0 or congestion_ratio < 0:
         return fallback_condition, "Live indices unavailable, using model fallback."
 
@@ -909,6 +920,7 @@ elif page == "Predictions":
                     congestion_ratio=features["congestion_ratio"],
                     fallback_condition=model_condition,
                     profile_name=live_profile,
+                    selected_hour=selected_hour,
                 )
                 result["condition"] = live_condition
                 render_prediction_result(result)
