@@ -479,38 +479,42 @@ def derive_live_condition_from_index(travel_time_index, congestion_ratio, fallba
 def get_live_threshold_profile(profile_name):
     profiles = {
         "Conservative": {
-            "moderate_tti": 1.12,
-            "moderate_ratio": 0.18,
-            "heavy_tti": 1.42,
-            "heavy_ratio": 0.48,
+            "moderate_tti": 1.08,
+            "moderate_ratio": 0.12,
+            "heavy_tti": 1.25,
+            "heavy_ratio": 0.30,
         },
         "Balanced": {
-            "moderate_tti": 1.18,
-            "moderate_ratio": 0.22,
-            "heavy_tti": 1.55,
-            "heavy_ratio": 0.55,
+            "moderate_tti": 1.12,
+            "moderate_ratio": 0.16,
+            "heavy_tti": 1.35,
+            "heavy_ratio": 0.40,
         },
         "Aggressive": {
-            "moderate_tti": 1.25,
-            "moderate_ratio": 0.30,
-            "heavy_tti": 1.70,
-            "heavy_ratio": 0.65,
+            "moderate_tti": 1.18,
+            "moderate_ratio": 0.22,
+            "heavy_tti": 1.50,
+            "heavy_ratio": 0.50,
         },
     }
     return profiles.get(profile_name, profiles["Balanced"])
 
 
 def is_free_flow_override_hour(hour_value):
-    # User-requested fixed windows for forcing Free Flow.
-    return (
-        hour_value in {22, 23, 0, 1, 2, 3, 4, 5, 6, 7}
-        or hour_value in {12, 13, 14}
-    )
+    # Off-peak fixed window only.
+    return hour_value in {22, 23, 0, 1, 2, 3, 4, 5, 6, 7}
 
 
-def derive_live_condition_with_profile(travel_time_index, congestion_ratio, fallback_condition, profile_name, selected_hour=None):
+def derive_live_condition_with_profile(
+    travel_time_index,
+    congestion_ratio,
+    fallback_condition,
+    profile_name,
+    selected_hour=None,
+    apply_offpeak_override=False,
+):
     # Direct real-time condition from live API indices with configurable sensitivity.
-    if selected_hour is not None and is_free_flow_override_hour(int(selected_hour)):
+    if apply_offpeak_override and selected_hour is not None and is_free_flow_override_hour(int(selected_hour)):
         return "Free Flow", "Time-based override applied for configured free-flow hours."
 
     if travel_time_index <= 0 or congestion_ratio < 0:
@@ -825,6 +829,12 @@ elif page == "Predictions":
             help="Controls how easily live condition changes between Free, Moderate, and Heavy.",
         )
 
+        apply_offpeak_override = st.checkbox(
+            "Force Free Flow during off-peak (22:00-07:00)",
+            value=False,
+            help="Enable only if you want a strict business rule override at night hours.",
+        )
+
         auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=True)
         refresh_available = False
         if auto_refresh:
@@ -921,6 +931,7 @@ elif page == "Predictions":
                     fallback_condition=model_condition,
                     profile_name=live_profile,
                     selected_hour=selected_hour,
+                    apply_offpeak_override=apply_offpeak_override,
                 )
                 result["condition"] = live_condition
                 render_prediction_result(result)
