@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import re
@@ -198,6 +198,71 @@ def fetch_live_tomtom_flow(lat, lon, api_key):
         raise ValueError(f"Unexpected API response: {payload}")
 
     return payload["flowSegmentData"]
+
+
+def build_departure_timestamp(selected_time):
+    now_dt = datetime.now()
+    departure_dt = now_dt.replace(
+        hour=selected_time.hour,
+        minute=selected_time.minute,
+        second=0,
+        microsecond=0,
+    )
+
+    # If selected time already passed today, use next day for predictive traffic lookup.
+    if departure_dt < now_dt:
+        departure_dt = departure_dt + timedelta(days=1)
+
+    return int(departure_dt.timestamp())
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_google_traffic_segment(lat, lon, api_key, departure_timestamp):
+    # Use a short nearby destination to derive duration_in_traffic and travel time index.
+    destination_lat = lat
+    destination_lon = lon + 0.02
+
+    url = (
+        "https://maps.googleapis.com/maps/api/distancematrix/json?"
+        + urlencode(
+            {
+                "origins": f"{lat},{lon}",
+                "destinations": f"{destination_lat},{destination_lon}",
+                "departure_time": departure_timestamp,
+                "traffic_model": "best_guess",
+                "key": api_key,
+            }
+        )
+    )
+
+    with urlopen(url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    rows = payload.get("rows", [])
+    if not rows or not rows[0].get("elements"):
+        raise ValueError(f"Unexpected Google traffic response: {payload}")
+
+    element = rows[0]["elements"][0]
+    if element.get("status") != "OK":
+        raise ValueError(f"Google traffic element unavailable: {element}")
+
+    distance_m = float(element["distance"]["value"])
+    duration_s = float(element["duration"]["value"])
+    duration_traffic_s = float(element.get("duration_in_traffic", {}).get("value", duration_s))
+
+    safe_duration_s = max(duration_s, 1.0)
+    safe_duration_traffic_s = max(duration_traffic_s, 1.0)
+
+    free_flow_speed = (distance_m / safe_duration_s) * 3.6
+    current_speed = (distance_m / safe_duration_traffic_s) * 3.6
+
+    return {
+        "currentSpeed": current_speed,
+        "freeFlowSpeed": free_flow_speed,
+        "currentTravelTime": duration_traffic_s,
+        "freeFlowTravelTime": duration_s,
+        "provider": "Google Maps",
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -397,6 +462,7 @@ def estimate_features_from_live_flow(flow_data, historical_df, selected_hour):
         "speed_clip_range": (speed_min, speed_max),
         "travel_time_index": float(travel_time_index),
         "relative_speed_ratio": relative_speed_ratio,
+        "provider": flow_data.get("provider", "Live API"),
     }
 
 
@@ -553,6 +619,8 @@ if "location_candidates" not in st.session_state:
     st.session_state["location_candidates"] = []
 if "live_prediction_history" not in st.session_state:
     st.session_state["live_prediction_history"] = []
+if "live_required_time" not in st.session_state:
+    st.session_state["live_required_time"] = datetime.now().time().replace(second=0, microsecond=0)
     
 # Sidebar Navigation
 # ----------------------------
@@ -732,8 +800,9 @@ elif page == "Predictions":
 
         selected_time = st.time_input(
             "Required Time of Day",
-            value=datetime.now().time().replace(second=0, microsecond=0),
+            value=st.session_state["live_required_time"],
             step=1800,
+            key="live_required_time",
             help="Prediction hour will use this selected time instead of current system time.",
         )
         selected_hour = int(selected_time.hour)
@@ -760,7 +829,27 @@ elif page == "Predictions":
             st.info("For better area names and suggestions, also set GOOGLE_MAPS_API_KEY in Streamlit secrets.")
         elif has_valid_location:
             try:
-                flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
+                departure_timestamp = build_departure_timestamp(selected_time)
+                source_note = ""
+
+                if google_maps_api_key:
+                    try:
+                        flow_data = fetch_google_traffic_segment(
+                            latitude,
+                            longitude,
+                            google_maps_api_key,
+                            departure_timestamp,
+                        )
+                        source_note = "Traffic source: Google Maps (selected-time traffic estimate)."
+                    except Exception:
+                        flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
+                        flow_data["provider"] = "TomTom"
+                        source_note = "Traffic source fallback: TomTom live flow."
+                else:
+                    flow_data = fetch_live_tomtom_flow(latitude, longitude, tomtom_api_key)
+                    flow_data["provider"] = "TomTom"
+                    source_note = "Traffic source: TomTom live flow (Google Maps key not configured)."
+
                 location_name = resolve_location_name(
                     latitude,
                     longitude,
@@ -797,6 +886,7 @@ elif page == "Predictions":
                 st.caption(
                     "Note: provider traffic timestamp is not exposed by this endpoint; shown time is fetch time."
                 )
+                st.caption(source_note)
 
                 if features["speed_was_clipped"]:
                     min_spd, max_spd = features["speed_clip_range"]
@@ -839,6 +929,7 @@ elif page == "Predictions":
                     "estimated_count": int(features["vehicle_count"]),
                     "travel_time_index": float(features["travel_time_index"]),
                     "congestion_ratio": float(features["congestion_ratio"]),
+                    "source": features.get("provider", "Live API"),
                 }
 
                 history = st.session_state.get("live_prediction_history", [])
@@ -871,6 +962,8 @@ elif page == "Predictions":
                             "confidence": "Confidence",
                         }
                     )
+                    if "source" in history_df.columns:
+                        summary_view["Traffic Source"] = history_df["source"]
                     if "travel_time_index" in history_df.columns:
                         summary_view["Travel Time Index"] = history_df["travel_time_index"].round(2)
                     if "congestion_ratio" in history_df.columns:
