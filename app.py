@@ -401,15 +401,51 @@ def estimate_features_from_live_flow(flow_data, historical_df, selected_hour):
 
 
 def derive_live_condition_from_index(travel_time_index, congestion_ratio, fallback_condition):
-    # Direct real-time condition from live API indices (explainable thresholds).
+    # Backward-compatible default: Balanced profile.
+    return derive_live_condition_with_profile(
+        travel_time_index=travel_time_index,
+        congestion_ratio=congestion_ratio,
+        fallback_condition=fallback_condition,
+        profile_name="Balanced",
+    )
+
+
+def get_live_threshold_profile(profile_name):
+    profiles = {
+        "Conservative": {
+            "moderate_tti": 1.12,
+            "moderate_ratio": 0.18,
+            "heavy_tti": 1.42,
+            "heavy_ratio": 0.48,
+        },
+        "Balanced": {
+            "moderate_tti": 1.18,
+            "moderate_ratio": 0.22,
+            "heavy_tti": 1.55,
+            "heavy_ratio": 0.55,
+        },
+        "Aggressive": {
+            "moderate_tti": 1.25,
+            "moderate_ratio": 0.30,
+            "heavy_tti": 1.70,
+            "heavy_ratio": 0.65,
+        },
+    }
+    return profiles.get(profile_name, profiles["Balanced"])
+
+
+def derive_live_condition_with_profile(travel_time_index, congestion_ratio, fallback_condition, profile_name):
+    # Direct real-time condition from live API indices with configurable sensitivity.
     if travel_time_index <= 0 or congestion_ratio < 0:
         return fallback_condition, "Live indices unavailable, using model fallback."
 
-    if travel_time_index >= 1.55 or congestion_ratio >= 0.55:
-        return "Heavy Congestion", "High delay and congestion ratio from live API."
-    if travel_time_index >= 1.18 or congestion_ratio >= 0.22:
-        return "Moderate Traffic", "Moderate delay/congestion observed from live API."
-    return "Free Flow", "Low delay and low congestion ratio from live API."
+    profile = get_live_threshold_profile(profile_name)
+
+    if travel_time_index >= profile["heavy_tti"] or congestion_ratio >= profile["heavy_ratio"]:
+        return "Heavy Congestion", f"High delay/congestion in {profile_name} profile."
+    if travel_time_index >= profile["moderate_tti"] or congestion_ratio >= profile["moderate_ratio"]:
+        return "Moderate Traffic", f"Moderate delay/congestion in {profile_name} profile."
+    return "Free Flow", f"Low delay/congestion in {profile_name} profile."
 
 
 def run_prediction(vehicle_count, vehicle_speed, hour, model, model_scaler, mapping):
@@ -702,6 +738,13 @@ elif page == "Predictions":
         )
         selected_hour = int(selected_time.hour)
 
+        live_profile = st.selectbox(
+            "Live Sensitivity Profile",
+            ["Conservative", "Balanced", "Aggressive"],
+            index=1,
+            help="Controls how easily live condition changes between Free, Moderate, and Heavy.",
+        )
+
         auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=True)
         refresh_available = False
         if auto_refresh:
@@ -770,14 +813,17 @@ elif page == "Predictions":
                     model_scaler=scaler,
                     mapping=cluster_mapping,
                 )
-                live_condition, live_reason = derive_live_condition_from_index(
+                model_condition = result["condition"]
+                live_condition, live_reason = derive_live_condition_with_profile(
                     travel_time_index=features["travel_time_index"],
                     congestion_ratio=features["congestion_ratio"],
-                    fallback_condition=result["condition"],
+                    fallback_condition=model_condition,
+                    profile_name=live_profile,
                 )
                 result["condition"] = live_condition
                 render_prediction_result(result)
                 st.info(f"Live condition basis: {live_reason}")
+                st.caption(f"Model cluster condition (secondary): {model_condition}")
 
                 timeline_now = datetime.now()
                 entry = {
@@ -787,9 +833,12 @@ elif page == "Predictions":
                     "lat": latitude,
                     "lon": longitude,
                     "condition": result["condition"],
+                    "model_condition": model_condition,
                     "confidence": float(result["confidence"]),
                     "speed": float(features["raw_vehicle_speed"]),
                     "estimated_count": int(features["vehicle_count"]),
+                    "travel_time_index": float(features["travel_time_index"]),
+                    "congestion_ratio": float(features["congestion_ratio"]),
                 }
 
                 history = st.session_state.get("live_prediction_history", [])
@@ -822,6 +871,10 @@ elif page == "Predictions":
                             "confidence": "Confidence",
                         }
                     )
+                    if "travel_time_index" in history_df.columns:
+                        summary_view["Travel Time Index"] = history_df["travel_time_index"].round(2)
+                    if "congestion_ratio" in history_df.columns:
+                        summary_view["Congestion Ratio"] = (history_df["congestion_ratio"] * 100).round(1).astype(str) + "%"
                     summary_view = summary_view.tail(10)
                     st.dataframe(summary_view, use_container_width=True, hide_index=True)
 
