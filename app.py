@@ -8,12 +8,18 @@ import json
 import os
 import re
 from urllib.parse import urlencode, quote
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 import warnings
 warnings.filterwarnings('ignore')
+
+try:
+    from streamlit_searchbox import st_searchbox
+except Exception:
+    st_searchbox = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE_CANDIDATES = [
@@ -54,17 +60,37 @@ def trigger_auto_refresh(interval_ms, key):
         return False
 
 
+def is_configured_api_key(raw_key):
+    if not raw_key:
+        return False
+
+    key = str(raw_key).strip()
+    if not key:
+        return False
+
+    placeholder_tokens = [
+        "your_",
+        "replace",
+        "example",
+        "paste",
+        "enter_",
+        "api_key_here",
+    ]
+    lowered = key.lower()
+    return not any(token in lowered for token in placeholder_tokens)
+
+
 def get_tomtom_api_key():
     # Preferred source in deployment: Streamlit secrets.
     try:
         secret_key = st.secrets.get("TOMTOM_API_KEY")
-        if secret_key:
+        if is_configured_api_key(secret_key):
             return str(secret_key).strip()
     except Exception:
         pass
 
     env_key = os.getenv("TOMTOM_API_KEY")
-    if env_key:
+    if is_configured_api_key(env_key):
         return env_key.strip()
 
     # Local fallback: read from test_api.py without importing executable code.
@@ -73,7 +99,9 @@ def get_tomtom_api_key():
         text = api_file.read_text(encoding="utf-8", errors="ignore")
         match = re.search(r'API_KEY\s*=\s*["\']([^"\']+)["\']', text)
         if match:
-            return match.group(1).strip()
+            candidate = match.group(1).strip()
+            if is_configured_api_key(candidate):
+                return candidate
 
     return None
 
@@ -81,13 +109,13 @@ def get_tomtom_api_key():
 def get_google_maps_api_key():
     try:
         secret_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
-        if secret_key:
+        if is_configured_api_key(secret_key):
             return str(secret_key).strip()
     except Exception:
         pass
 
     env_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    if env_key:
+    if is_configured_api_key(env_key):
         return env_key.strip()
 
     return None
@@ -191,8 +219,13 @@ def fetch_live_tomtom_flow(lat, lon, api_key):
         + urlencode(params)
     )
 
-    with urlopen(url, timeout=15) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(url, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        if e.code in (401, 403):
+            raise ValueError("TomTom API authorization failed (401/403). Check TOMTOM_API_KEY in secrets.") from e
+        raise
 
     if "flowSegmentData" not in payload:
         raise ValueError(f"Unexpected API response: {payload}")
@@ -235,8 +268,17 @@ def fetch_google_traffic_segment(lat, lon, api_key, departure_timestamp):
         )
     )
 
-    with urlopen(url, timeout=15) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(url, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        if e.code in (401, 403):
+            raise ValueError("Google Maps API authorization failed (401/403). Check GOOGLE_MAPS_API_KEY in secrets.") from e
+        raise
+
+    if payload.get("status") == "REQUEST_DENIED":
+        error_text = payload.get("error_message", "Google Maps API request denied.")
+        raise ValueError(error_text)
 
     rows = payload.get("rows", [])
     if not rows or not rows[0].get("elements"):
@@ -310,6 +352,47 @@ def fetch_location_name_google(lat, lon, api_key):
     return results[0].get("formatted_address", "Unknown location")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_location_name_nominatim(lat, lon):
+    url = (
+        "https://nominatim.openstreetmap.org/reverse?"
+        + urlencode(
+            {
+                "format": "jsonv2",
+                "lat": lat,
+                "lon": lon,
+                "zoom": 18,
+                "addressdetails": 1,
+            }
+        )
+    )
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "UrbanTrafficClustering/1.0 (Streamlit demo)",
+            "Accept-Language": "en",
+        },
+    )
+
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    display_name = payload.get("display_name")
+    if display_name:
+        return display_name
+
+    address = payload.get("address", {})
+    parts = [
+        address.get("road"),
+        address.get("suburb"),
+        address.get("city"),
+        address.get("state"),
+        address.get("country"),
+    ]
+    fallback = ", ".join([part for part in parts if part])
+    return fallback if fallback else "Unknown location"
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def search_locations_google(query, api_key, limit=5, country_code="in"):
     q = query.strip()
@@ -361,6 +444,47 @@ def search_locations_google(query, api_key, limit=5, country_code="in"):
     return results
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def search_locations_nominatim(query, limit=5, country_code="in"):
+    q = query.strip()
+    if not q:
+        return []
+
+    url = (
+        "https://nominatim.openstreetmap.org/search?"
+        + urlencode(
+            {
+                "format": "jsonv2",
+                "q": q,
+                "limit": limit,
+                "addressdetails": 1,
+                "countrycodes": country_code.lower(),
+            }
+        )
+    )
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "UrbanTrafficClustering/1.0 (Streamlit demo)",
+            "Accept-Language": "en",
+        },
+    )
+
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    results = []
+    for item in payload[:limit]:
+        lat = item.get("lat")
+        lon = item.get("lon")
+        label = item.get("display_name")
+        if lat is None or lon is None:
+            continue
+        results.append({"label": label or q, "lat": float(lat), "lon": float(lon)})
+
+    return results
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def search_locations_by_text(query, api_key, limit=5, country_set="IN"):
     q = query.strip()
@@ -399,9 +523,15 @@ def resolve_location_name(lat, lon, tomtom_api_key, google_maps_api_key):
             pass
 
     if tomtom_api_key:
-        return fetch_location_name_tomtom(lat, lon, tomtom_api_key)
+        try:
+            return fetch_location_name_tomtom(lat, lon, tomtom_api_key)
+        except Exception:
+            pass
 
-    return "Unknown location"
+    try:
+        return fetch_location_name_nominatim(lat, lon)
+    except Exception:
+        return "Unknown location"
 
 
 def resolve_location_suggestions(query, tomtom_api_key, google_maps_api_key, limit=5, country_code="in"):
@@ -412,9 +542,26 @@ def resolve_location_suggestions(query, tomtom_api_key, google_maps_api_key, lim
             pass
 
     if tomtom_api_key:
-        return search_locations_by_text(query, tomtom_api_key, limit=limit, country_set=country_code.upper())
+        try:
+            return search_locations_by_text(query, tomtom_api_key, limit=limit, country_set=country_code.upper())
+        except Exception:
+            pass
 
-    return []
+    try:
+        return search_locations_nominatim(query, limit=limit, country_code=country_code)
+    except Exception:
+        return []
+
+
+def search_location_labels(query, tomtom_api_key, google_maps_api_key, limit=8, country_code="in"):
+    suggestions = resolve_location_suggestions(
+        query,
+        tomtom_api_key=tomtom_api_key,
+        google_maps_api_key=google_maps_api_key,
+        limit=limit,
+        country_code=country_code,
+    )
+    return [item["label"] for item in suggestions]
 
 
 def estimate_features_from_live_flow(flow_data, historical_df, selected_hour):
@@ -636,6 +783,26 @@ if "live_prediction_history" not in st.session_state:
     st.session_state["live_prediction_history"] = []
 if "live_required_time" not in st.session_state:
     st.session_state["live_required_time"] = datetime.now().time().replace(second=0, microsecond=0)
+if "prediction_source_mode" not in st.session_state:
+    st.session_state["prediction_source_mode"] = "Live API" if tomtom_api_key else "Manual Input"
+if "manual_vehicle_count" not in st.session_state:
+    st.session_state["manual_vehicle_count"] = int(np.clip(df['Vehicle_Count'].median(), 0, 1000))
+if "manual_vehicle_speed" not in st.session_state:
+    st.session_state["manual_vehicle_speed"] = float(np.clip(df['Vehicle_Speed'].median(), 0.0, 150.0))
+if "manual_hour" not in st.session_state:
+    st.session_state["manual_hour"] = 12
+if "live_latitude" not in st.session_state:
+    st.session_state["live_latitude"] = 17.3850
+if "live_longitude" not in st.session_state:
+    st.session_state["live_longitude"] = 78.4867
+if "live_coord_mode" not in st.session_state:
+    st.session_state["live_coord_mode"] = "Manual Coordinates"
+if "live_profile" not in st.session_state:
+    st.session_state["live_profile"] = "Balanced"
+if "live_offpeak_override" not in st.session_state:
+    st.session_state["live_offpeak_override"] = False
+if "live_auto_refresh" not in st.session_state:
+    st.session_state["live_auto_refresh"] = True
     
 # Sidebar Navigation
 # ----------------------------
@@ -762,7 +929,8 @@ elif page == "Predictions":
         ["Live API", "Manual Input"],
         horizontal=True,
         index=0 if tomtom_api_key else 1,
-        help="Live API uses TomTom flow speed and estimates vehicle count from learned data range.",
+        key="prediction_source_mode",
+        help="Live API uses TomTom/Google traffic data when API keys are configured.",
     )
 
     if source_mode == "Live API":
@@ -770,47 +938,69 @@ elif page == "Predictions":
             "Location Input Mode",
             ["Manual Coordinates", "Search by Location Name"],
             horizontal=True,
+            key="live_coord_mode",
         )
 
-        latitude = 17.3850
-        longitude = 78.4867
+        latitude = st.session_state["live_latitude"]
+        longitude = st.session_state["live_longitude"]
         has_valid_location = True
 
         if coord_mode == "Manual Coordinates":
             col1, col2 = st.columns(2)
             with col1:
-                latitude = st.number_input("Latitude", value=17.3850, format="%.6f")
+                latitude = st.number_input("Latitude", value=st.session_state["live_latitude"], format="%.6f", key="live_latitude")
             with col2:
-                longitude = st.number_input("Longitude", value=78.4867, format="%.6f")
+                longitude = st.number_input("Longitude", value=st.session_state["live_longitude"], format="%.6f", key="live_longitude")
         else:
-            location_query = st.text_input(
-                "Type location or area",
-                value="Hyderabad",
-                help="Suggestions appear while typing. Google Maps is used when GOOGLE_MAPS_API_KEY is configured.",
-            )
-
-            if len(location_query.strip()) >= 3:
-                try:
-                    st.session_state["location_candidates"] = resolve_location_suggestions(
+            search_placeholder = "Type location or area"
+            if st_searchbox is not None:
+                location_query = st_searchbox(
+                    lambda q: search_location_labels(
+                        q,
+                        tomtom_api_key=tomtom_api_key,
+                        google_maps_api_key=google_maps_api_key,
+                        limit=8,
+                        country_code="in",
+                    ),
+                    placeholder=search_placeholder,
+                    key="location_searchbox",
+                )
+                candidates = []
+                if location_query:
+                    candidates = resolve_location_suggestions(
                         location_query,
                         tomtom_api_key=tomtom_api_key,
                         google_maps_api_key=google_maps_api_key,
                         limit=8,
                         country_code="in",
                     )
-                except Exception as e:
-                    st.error(f"Error searching location: {str(e)}")
+            else:
+                location_query = st.text_input(
+                    "Type location or area",
+                    value="Hyderabad",
+                    help="Suggestions appear while typing. Google Maps is used when configured; otherwise free OpenStreetMap suggestions are used.",
+                )
 
-            candidates = st.session_state.get("location_candidates", [])
+                candidates = []
+                if len(location_query.strip()) >= 3:
+                    try:
+                        candidates = resolve_location_suggestions(
+                            location_query,
+                            tomtom_api_key=tomtom_api_key,
+                            google_maps_api_key=google_maps_api_key,
+                            limit=8,
+                            country_code="in",
+                        )
+                    except Exception as e:
+                        st.error(f"Error searching location: {str(e)}")
+
             if candidates:
-                option_labels = [c["label"] for c in candidates]
-                selected_label = st.selectbox("Select area from results", option_labels)
-                selected_candidate = next((c for c in candidates if c["label"] == selected_label), candidates[0])
+                selected_candidate = next((c for c in candidates if c["label"] == location_query), candidates[0])
                 latitude = selected_candidate["lat"]
                 longitude = selected_candidate["lon"]
                 st.caption(f"Selected coordinates: {latitude:.6f}, {longitude:.6f}")
             else:
-                st.info("Type at least 3 characters to get location suggestions.")
+                st.info("Start typing a location to see suggestions. Free OpenStreetMap fallback is used if paid APIs are not configured.")
                 has_valid_location = False
 
         selected_time = st.time_input(
@@ -826,30 +1016,53 @@ elif page == "Predictions":
             "Live Sensitivity Profile",
             ["Conservative", "Balanced", "Aggressive"],
             index=1,
+            key="live_profile",
             help="Controls how easily live condition changes between Free, Moderate, and Heavy.",
         )
 
         apply_offpeak_override = st.checkbox(
             "Force Free Flow during off-peak (22:00-07:00)",
-            value=False,
+            value=st.session_state["live_offpeak_override"],
+            key="live_offpeak_override",
             help="Enable only if you want a strict business rule override at night hours.",
         )
 
-        auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=True)
+        auto_refresh = st.checkbox("Auto refresh every 30 seconds", value=st.session_state["live_auto_refresh"], key="live_auto_refresh")
         refresh_available = False
         if auto_refresh:
             refresh_available = trigger_auto_refresh(interval_ms=30_000, key="live_api_refresh")
         if auto_refresh and not refresh_available:
             st.warning("Install streamlit-autorefresh to enable timed refresh. Use manual refresh button for now.")
 
-        if not tomtom_api_key:
-            st.error("TomTom API key not found.")
-            st.info(
-                "Set TOMTOM_API_KEY in Streamlit secrets for deployment, or define API_KEY in test_api.py for local testing."
-            )
-            st.info("For better area names and suggestions, also set GOOGLE_MAPS_API_KEY in Streamlit secrets.")
-        elif has_valid_location:
-            try:
+        if has_valid_location:
+            st.markdown("---")
+            st.subheader("Location")
+
+            if google_maps_api_key or tomtom_api_key:
+                location_name = resolve_location_name(
+                    latitude,
+                    longitude,
+                    tomtom_api_key=tomtom_api_key,
+                    google_maps_api_key=google_maps_api_key,
+                )
+            else:
+                location_name = f"Selected point ({latitude:.6f}, {longitude:.6f})"
+
+            st.write(location_name)
+            st.map(pd.DataFrame({"lat": [latitude], "lon": [longitude]}), use_container_width=True)
+
+            if not tomtom_api_key and not google_maps_api_key:
+                st.warning("Live traffic fetch requires API keys. Map preview is shown, but live traffic metrics are unavailable.")
+                with st.expander("How to enable Live API mode"):
+                    st.write("1. Create .streamlit/secrets.toml if it does not exist.")
+                    st.write("2. Add your real keys:")
+                    st.code(
+                        'TOMTOM_API_KEY = "your_real_tomtom_key"\n'
+                        'GOOGLE_MAPS_API_KEY = "your_real_google_maps_key"',
+                        language="toml",
+                    )
+                    st.write("3. Restart Streamlit to load the keys.")
+            else:
                 departure_timestamp = build_departure_timestamp(selected_time)
                 source_note = ""
 
@@ -871,19 +1084,8 @@ elif page == "Predictions":
                     flow_data["provider"] = "TomTom"
                     source_note = "Traffic source: TomTom live flow (Google Maps key not configured)."
 
-                location_name = resolve_location_name(
-                    latitude,
-                    longitude,
-                    tomtom_api_key=tomtom_api_key,
-                    google_maps_api_key=google_maps_api_key,
-                )
                 features = estimate_features_from_live_flow(flow_data, df, selected_hour)
                 features["hour"] = selected_hour
-
-                st.markdown("---")
-                st.subheader("Location")
-                st.write(f"{location_name}")
-                st.map(pd.DataFrame({"lat": [latitude], "lon": [longitude]}), use_container_width=True)
 
                 st.subheader("Live Data Snapshot")
                 l1, l2, l3, l4 = st.columns(4)
@@ -996,9 +1198,6 @@ elif page == "Predictions":
 
                 if result["confidence"] < 0.35:
                     st.info("Low-confidence prediction: this live input is far from common patterns in the training data.")
-
-            except Exception as e:
-                st.error(f"Error fetching live API data or predicting traffic condition: {str(e)}")
         else:
             st.info("Select a valid India location from suggestions to fetch live traffic condition.")
 
@@ -1006,27 +1205,27 @@ elif page == "Predictions":
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            default_vehicle_count = int(np.clip(df['Vehicle_Count'].median(), 0, 1000))
             vehicle_count = st.number_input(
                 "Vehicle Count",
                 min_value=0,
                 max_value=1000,
-                value=default_vehicle_count,
+                value=st.session_state["manual_vehicle_count"],
                 step=1,
+                key="manual_vehicle_count",
             )
 
         with col2:
-            default_vehicle_speed = float(np.clip(df['Vehicle_Speed'].median(), 0.0, 150.0))
             vehicle_speed = st.number_input(
                 "Vehicle Speed (km/h)",
                 min_value=0.0,
                 max_value=150.0,
-                value=default_vehicle_speed,
+                value=st.session_state["manual_vehicle_speed"],
                 step=0.1,
+                key="manual_vehicle_speed",
             )
 
         with col3:
-            hour = st.slider("Hour of Day", hour_min, hour_max, value=12)
+            hour = st.slider("Hour of Day", hour_min, hour_max, value=st.session_state["manual_hour"], key="manual_hour")
 
         if st.button("🎯 Predict Traffic Pattern", use_container_width=True):
             try:
